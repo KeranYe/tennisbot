@@ -1,0 +1,3 @@
+[submodule "thirdparty/FTServo_Python"]
+	path = thirdparty/FTServo_Python
+	url = https://gitee.com/ftservo/FTServo_Python.git
