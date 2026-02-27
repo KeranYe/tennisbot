@@ -1,15 +1,12 @@
 #!/usr/bin/env python
 #
-# *********     Gen Write Example      *********
-#
-#
-# Available SCServo model on this example : All models using Protocol SCS
-# This example is tested with a SCServo(STS/SMS), and an URT
-#
+# *********     Wheel Control Example      *********
+# 2 threads: one for velocity read/write, one for keyboard input
 
 import sys, tty, termios
 import os
 import time
+import threading
 
 sys.path.append("../thirdparty/FTServo_Python")
 # sys.path.append("..")
@@ -19,12 +16,35 @@ def getch():
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:
-        tty.setraw(fd)
+        tty.setcbreak(fd)
         return sys.stdin.read(1)
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
+def step2rot(step):
+    # convert step (0~4095) to rotation (0~2pi)
+    rot = step / 4095
+    return rot
 
+def step2ang(step): 
+    # convert step (0~4095) to angle (rad)
+    ang = step / 4095 * 2 * 3.1415
+    return ang
+
+def step2angDeg(step):
+    # convert step (0~4095) to angle (deg)
+    angDeg = step / 4095 * 360
+    return angDeg
+
+def rpm2stepVel(rpm): 
+    # convert rpm to step velocity (0~3200)
+    step_vel = int(rpm / 0.732 * 50)
+    return step_vel
+
+def stepVel2rpm(step_vel):
+    # convert step velocity (0~3200) to rpm
+    rpm = step_vel * 0.732 / 50
+    return rpm
 
 # Initialize PortHandler instance
 # Set the port path
@@ -60,45 +80,63 @@ for scs_id in range(1, 4):
 
 # parameters
 dir = [-1, 1, 1] # direction: 1 for forward, -1 for reverse
-vel = [1000, 1000, 3000] # velocity: 0
+vel = [3200, 3200, 0] # velocity: 0
+rpm = [30, 30, 0] # velocity: 0
 acc = [50, 50, 50] # acceleration: 0
 
-while 1:
-    ch = getch()
-    if ch == 'q':
-        print("Quit!")
-        break
-    elif ch == 'r':
-        print("Rotate!")
-    else: 
-        continue
+stop_event = threading.Event()
+run_event = threading.Event()
 
-    # # somehow in this way, the velocity commands are not executed consistently. wheel 1 runs faster than wheel 2, even though they have the same velocity and acceleration parameters.  
-    # for scs_id in range(1, 4):
-    #     # Add servo(id)#1~3 goal position\moving speed\moving accc value to the Syncwrite parameter storage
-    #     # Servo (ID1~3) sync write velocity 1000 with acceleration 50
-    #     scs_addparam_result = packetHandler.SyncWritePosEx(scs_id, 0, vel[scs_id-1]*dir[scs_id-1], acc[scs_id-1])
-    #     if scs_addparam_result != True:
-    #         print("[ID:%03d] groupSyncWrite addparam failed" % scs_id)
+def velocity_worker():
+    while not stop_event.is_set():
+        if not run_event.is_set():
+            time.sleep(0.05)
+            continue
 
-    # # Syncwrite goal position
-    # scs_comm_result = packetHandler.groupSyncWrite.txPacket()
-    # if scs_comm_result != COMM_SUCCESS:
-    #     print("%s" % packetHandler.getTxRxResult(scs_comm_result))
+        # velocity estimate
+        for scs_id in range(1, 4):
+            scs_present_position, scs_present_speed, scs_comm_result, scs_error = packetHandler.ReadPosSpeed(scs_id)
+            if scs_comm_result != COMM_SUCCESS:
+                print(packetHandler.getTxRxResult(scs_comm_result))
+            else:
+                print("[ID:%03d] Pos:%f[deg] PresSpd:%f[rpm]" % (scs_id, step2angDeg(scs_present_position), stepVel2rpm(scs_present_speed)))
+            if scs_error != 0:
+                print(packetHandler.getRxPacketError(scs_error))
 
-    # # Clear syncwrite parameter storage
-    # packetHandler.groupSyncWrite.clearParam()
+        # velocity command
+        for scs_id in range(1, 4):
+            # scs_comm_result, scs_error = packetHandler.WriteSpec(scs_id, vel[scs_id-1]*dir[scs_id-1], acc[scs_id-1])
+            scs_comm_result, scs_error = packetHandler.WriteSpec(scs_id, rpm2stepVel(rpm[scs_id-1])*dir[scs_id-1], acc[scs_id-1])
 
-    # time.sleep(1);
+            if scs_comm_result != COMM_SUCCESS:
+                print("%s" % packetHandler.getTxRxResult(scs_comm_result))
+            if scs_error != 0:
+                print("%s" % packetHandler.getRxPacketError(scs_error))
 
-    for scs_id in range(1, 4): 
-        scs_comm_result, scs_error = packetHandler.WriteSpec(scs_id, vel[scs_id-1]*dir[scs_id-1], acc[scs_id-1])
-        if scs_comm_result != COMM_SUCCESS:
-            print("%s" % packetHandler.getTxRxResult(scs_comm_result))
-        if scs_error != 0:
-            print("%s" % packetHandler.getRxPacketError(scs_error))
-    
-    time.sleep(0.01);
+        time.sleep(1.0)
+
+def keyboard_worker():
+    print("Press 'r' to start/continue rotation, 'q' to quit")
+    while not stop_event.is_set():
+        ch = getch()
+        if ch == 'q':
+            print("Quit!")
+            stop_event.set()
+            break
+        elif ch == 'r':
+            if not run_event.is_set():
+                print("Rotate!")
+            run_event.set()
+
+velocity_thread = threading.Thread(target=velocity_worker)
+keyboard_thread = threading.Thread(target=keyboard_worker)
+
+velocity_thread.start()
+keyboard_thread.start()
+
+keyboard_thread.join()
+stop_event.set()
+velocity_thread.join()
 
     
 
@@ -107,7 +145,6 @@ for scs_id in range(1, 4):
     # Add servo(id)#1~3 goal position\moving speed\moving accc value to the Syncwrite parameter storage
     # Servo (ID1~3) sync write velocity 1000 with acceleration 50
     scs_addparam_result = packetHandler.SyncWritePosEx(scs_id, 0, 0, 50)
-    # scs_addparam_result = packetHandler.SyncWritePosEx(scs_id, 4095, 60, 50)
     if scs_addparam_result != True:
         print("[ID:%03d] groupSyncWrite addparam failed" % scs_id)
 
