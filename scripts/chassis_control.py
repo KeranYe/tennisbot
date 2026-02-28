@@ -17,6 +17,7 @@ sys.path.append("../thirdparty/FTServo_Python")
 # sys.path.append("..")
 from scservo_sdk import *                      # Uses FTServo SDK library
 from keyboad_input import KeyboardInputController
+from gamepad_input import GamepadInputController
 
 # define wheel class
 class Wheel:
@@ -181,6 +182,7 @@ class Chassis:
         self.inlet_enabled = False
         self.inlet_vel_cmd = self.max_inlet_vel
         self.keyboard_controller = KeyboardInputController(self)
+        self.gamepad_controller = GamepadInputController(self)
 
     def _clamp(self, value, min_value, max_value):
         return max(min_value, min(max_value, value))
@@ -295,6 +297,9 @@ class Chassis:
     def startKeyboardControl(self):
         self._startInputControl(self.keyboard_controller.worker)
 
+    def startGamepadControl(self):
+        self._startInputControl(self.gamepad_controller.worker)
+
 def main():
     # Initialize PortHandler instance
     # Set the port path
@@ -326,7 +331,8 @@ def main():
                     max_linear_vel=0.2, max_angular_vel_deg=45, max_inlet_vel=3.0
                     )
 
-    chassis.startKeyboardControl()
+    # chassis.startKeyboardControl()
+    chassis.startGamepadControl()
         
     # Close port
     portHandler.closePort()
