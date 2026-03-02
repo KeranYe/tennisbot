@@ -1,0 +1,109 @@
+<mujoco>
+  <compiler autolimits="true"/>
+
+  <asset>
+    <!-- Environment-->
+    <texture name="grid" type="2d" builtin="checker" width="512" height="512" rgb1=".1 .2 .3" rgb2=".2 .3 .4"/>
+    <material name="grid" texture="grid" texrepeat="1 1" texuniform="true" reflectance=".2"/>
+
+    <!-- Visual -->
+    <mesh name="visual_chassis_mesh" file="../mesh/visual/Visual_Chassis.stl" scale="1 1 1"/>
+
+    <!-- Collision-->
+    <mesh name="collision_inlet_base_mesh_1" file="../mesh/collision/Collision_Chassis_InletBase_1_1.stl" scale="1 1 1"/>
+    <mesh name="collision_inlet_base_mesh_2" file="../mesh/collision/Collision_Chassis_InletBase_1_2.stl" scale="1 1 1"/>
+    <mesh name="collision_inlet_base_mesh_3" file="../mesh/collision/Collision_Chassis_InletBase_1_3.stl" scale="1 1 1"/>
+
+    <mesh name="collision_inlet_passage_mesh_1" file="../mesh/collision/Collision_Chassis_InletPassage_1_1.stl" scale="1 1 1"/>
+    <mesh name="collision_inlet_passage_mesh_2" file="../mesh/collision/Collision_Chassis_InletPassage_1_2.stl" scale="1 1 1"/>
+    <mesh name="collision_inlet_passage_mesh_3" file="../mesh/collision/Collision_Chassis_InletPassage_1_3.stl" scale="1 1 1"/>
+    <mesh name="collision_inlet_passage_mesh_4" file="../mesh/collision/Collision_Chassis_InletPassage_1_4.stl" scale="1 1 1"/>
+    <mesh name="collision_inlet_passage_mesh_5" file="../mesh/collision/Collision_Chassis_InletPassage_1_5.stl" scale="1 1 1"/>
+    <mesh name="collision_inlet_passage_mesh_6" file="../mesh/collision/Collision_Chassis_InletPassage_1_6.stl" scale="1 1 1"/>
+  </asset>
+
+  <default>
+    <joint damping=".03" actuatorfrcrange="-0.5 0.5"/>
+    
+    <default class="wheel">
+      <geom type="cylinder" size=".03 .01" rgba=".5 .5 1 1"/>
+    </default>
+    
+    <default class="decor">
+      <site type="box" rgba=".5 1 .5 1"/>
+    </default>
+
+    <!-- <default class="inlet_base">
+      <geom type="mesh" mesh="inlet_base_mesh" rgba=".8 .8 .8 1"/>
+    </default> -->
+
+  </default>
+
+  <worldbody>
+    <geom type="plane" size="3 3 .01" material="grid"/>
+    <body name="tennisbot" pos="0 0 .10">
+      <freejoint/>
+      
+      <!-- <light name="top light" pos="0 0 2" mode="trackcom" diffuse=".4 .4 .4"/> -->
+
+      <body name="chassis" pos="0 0 0">
+        <inertial pos="-0.147944 -0.013608 0.051689" mass="5.147531" fullinertia="0.03944 0.0423 0.05141 -0.003683 -0.002433 -0.0007925"/>
+        
+        <!-- collision geom-->
+        <geom type="mesh" mesh="collision_inlet_base_mesh_1" contype="1" conaffinity="1" group="1" rgba=".8 .8 .8 0.1" friction="1 0.5 0.1"/>
+        <geom type="mesh" mesh="collision_inlet_base_mesh_2" contype="1" conaffinity="1" group="1" rgba=".8 .8 .8 0.1" friction="1 0.5 0.1"/>
+        <geom type="mesh" mesh="collision_inlet_base_mesh_3" contype="1" conaffinity="1" group="1" rgba=".8 .8 .8 0.1" friction="1 0.5 0.1"/>
+
+        <geom type="mesh" mesh="collision_inlet_passage_mesh_1" contype="1" conaffinity="1" group="1" rgba=".8 .8 .8 0.1" friction="1 0.5 0.1"/>
+        <geom type="mesh" mesh="collision_inlet_passage_mesh_2" contype="1" conaffinity="1" group="1" rgba=".8 .8 .8 0.1" friction="1 0.5 0.1"/>
+        <geom type="mesh" mesh="collision_inlet_passage_mesh_3" contype="1" conaffinity="1" group="1" rgba=".8 .8 .8 0.1" friction="1 0.5 0.1"/>
+        <geom type="mesh" mesh="collision_inlet_passage_mesh_4" contype="1" conaffinity="1" group="1" rgba=".8 .8 .8 0.1" friction="1 0.5 0.1"/>
+        <geom type="mesh" mesh="collision_inlet_passage_mesh_5" contype="1" conaffinity="1" group="1" rgba=".8 .8 .8 0.1" friction="1 0.5 0.1"/>
+        <geom type="mesh" mesh="collision_inlet_passage_mesh_6" contype="1" conaffinity="1" group="1" rgba=".8 .8 .8 0.1" friction="1 0.5 0.1"/>
+
+        <!-- visual geom-->
+        <geom type="mesh" mesh="visual_chassis_mesh" contype="0" conaffinity="0" group="0" rgba="1 1 0 0.5" />
+      </body>
+      
+      <!-- <geom name="front wheel" pos=".08 0 -.015" type="sphere" size=".015" condim="1" priority="1"/>
+      
+      <light name="front light" pos=".1 0 .02" dir="2 0 -1" diffuse="1 1 1"/>
+      
+      <body name="left wheel" pos="-.07 .06 0" zaxis="0 1 0">
+        <joint name="left"/>
+        <geom class="wheel"/>
+        <site class="decor" size=".006 .025 .012"/>
+        <site class="decor" size=".025 .006 .012"/>
+      </body>
+      
+      <body name="right wheel" pos="-.07 -.06 0" zaxis="0 1 0">
+        <joint name="right"/>
+        <geom class="wheel"/>
+        <site class="decor" size=".006 .025 .012"/>
+        <site class="decor" size=".025 .006 .012"/>
+      </body> -->
+
+    </body>
+  </worldbody>
+
+  <!-- <tendon>
+    <fixed name="forward">
+      <joint joint="left" coef=".5"/>
+      <joint joint="right" coef=".5"/>
+    </fixed>
+    <fixed name="turn">
+      <joint joint="left" coef="-.5"/>
+      <joint joint="right" coef=".5"/>
+    </fixed>
+  </tendon>
+
+  <actuator>
+    <motor name="forward" tendon="forward" ctrlrange="-1 1"/>
+    <motor name="turn" tendon="turn" ctrlrange="-1 1"/>
+  </actuator>
+
+  <sensor>
+    <jointactuatorfrc name="right" joint="right"/>
+    <jointactuatorfrc name="left" joint="left"/>
+  </sensor> -->
+</mujoco>
