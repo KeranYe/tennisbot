@@ -30,3 +30,36 @@ Physical-5
 		izx	36930000
 		izy	2828000
 		izz	165000000
+
+Part Name	wheel_od200
+Physical-5
+	Mass	195.438 g
+	Volume	245900 mm³
+	Density	0.001 g / mm³
+	Area	115400 mm²
+	World X,Y,Z	0.00 mm, 0.00 mm, 0.00 mm
+	Center of Mass	-4.243E-09 mm, 0.00 mm, 13.298 mm
+	Bounding Box-0
+		Length	199 mm
+		Width	199 mm
+		Height	29 mm
+	Moment of Inertia at Center of Mass (g mm²)-1
+		ixx	712600, 0.0007126
+		ixy	-1.033e-9
+		ixz	-0.000004516
+		iyx	-1.033e-9
+		iyy	712600, 0.0007126
+		iyz	0
+		izx	-0.000004516
+		izy	0
+		izz	1403000, 0.001403
+	Moment of Inertia at Origin (g mm²)-2
+		ixx	747200
+		ixy	-1.033e-9
+		ixz	0.000006511
+		iyx	-1.033e-9
+		iyy	747200
+		iyz	0
+		izx	0.000006511
+		izy	0
+		izz	1403000
