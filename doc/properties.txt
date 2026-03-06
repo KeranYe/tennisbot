@@ -1,35 +1,35 @@
 Part Name	chassis_assembly
 Physical-5
-	Mass	5147.531 g
-	Volume	2107000 mm^3
-	Density	0.002 g / mm^3
-	Area	1073000 mm^2
+	Mass	5419.723 g
+	Volume	2335000 mm³
+	Density	0.002 g / mm³
+	Area	1225000 mm²
 	World X,Y,Z	0.00 mm, 0.00 mm, 0.00 mm
-	Center of Mass	-147.944 mm, -13.608 mm, 51.689 mm
+	Center of Mass	-140.985 mm, -12.924 mm, 47.775 mm
 	Bounding Box-0
 		Length	310.716 mm
 		Width	284.264 mm
 		Height	454 mm
-	Moment of Inertia at Center of Mass (g mm^2)-1
-		ixx	39440000, 0.03944
-		ixy	-3683000, -0.003683
-		ixz	-2433000, -0.002433
-		iyx	-3683000
-		iyy	42300000, 0.0423
-		iyz	-792500, -0.0007925
-		izx	-2433000
-		izy	-792500
-		izz	51410000, 0.05141
-	Moment of Inertia at Origin (g mm^2)-2
-		ixx	54150000
+	Moment of Inertia at Center of Mass (g mm²)-1
+		ixx	43140000, 0.04314
+		ixy	-4170000, -0.00417
+		ixz	350900, 0.0003509
+		iyx	-4170000
+		iyy	49120000, 0.04912
+		iyz	-518300, -0.0005183
+		izx	350900
+		izy	-518300
+		izz	58420000, 0.05842
+	Moment of Inertia at Origin (g mm²)-2
+		ixx	56420000
 		ixy	-14050000
-		ixz	36930000
+		ixz	36860000
 		iyx	-14050000
-		iyy	168700000
+		iyy	169200000
 		iyz	2828000
-		izx	36930000
+		izx	36860000
 		izy	2828000
-		izz	165000000
+		izz	167000000
 
 Part Name	wheel_od200
 Physical-5
