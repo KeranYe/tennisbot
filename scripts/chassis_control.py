@@ -18,6 +18,7 @@ sys.path.append("../thirdparty/FTServo_Python")
 from scservo_sdk import *                      # Uses FTServo SDK library
 from keyboad_input import KeyboardInputController
 from gamepad_input import GamepadInputController
+from ball_finder import BallFinder
 
 # define wheel class
 class Wheel:
