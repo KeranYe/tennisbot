@@ -94,6 +94,8 @@ class InletVisualController:
         # Control gains
         self.k_linear = 0.5    # Proportional gain for linear velocity
         self.k_angular = 2.0   # Proportional gain for angular velocity
+        self.min_linear_vel = 0.05  # Minimum linear velocity (m/s) to avoid slow approach
+        self.min_angular_vel = math.radians(5.0)  # Minimum angular velocity (rad/s) to avoid slow turning
         self.waypoint_reach_threshold_m = 0.005  # 5mm, smaller than close waypoint spacing
         
     def transform_point(self, point, T):
@@ -466,6 +468,20 @@ class InletVisualController:
         linear_vel = self.k_linear * distance_error
         angular_vel = self.k_angular * angular_error
         
+        # Apply minimum linear velocity to avoid slow approach
+        if abs(linear_vel) > 1e-6:  # If non-zero, enforce minimum
+            if linear_vel > 0:
+                linear_vel = max(self.min_linear_vel, linear_vel)
+            else:
+                linear_vel = min(-self.min_linear_vel, linear_vel)
+        
+        # Apply minimum angular velocity to avoid slow turning
+        if abs(angular_vel) > 1e-6:  # If non-zero, enforce minimum
+            if angular_vel > 0:
+                angular_vel = max(self.min_angular_vel, angular_vel)
+            else:
+                angular_vel = min(-self.min_angular_vel, angular_vel)
+        
         # Clamp to chassis limits
         linear_vel = max(-self.chassis.max_linear_vel, 
                         min(self.chassis.max_linear_vel, linear_vel))
@@ -719,8 +735,8 @@ def main():
         inlet_disk_diameter=0.05,
         wheel_reduction=1,
         inlet_reduction=0.1,
-        max_linear_vel=0.15,  # Slower for visual servoing
-        max_angular_vel_deg=30,
+        max_linear_vel=0.225,  # 1.5x faster for visual servoing
+        max_angular_vel_deg=45,  # 1.5x faster angular velocity
         max_inlet_vel=3.0
     )
     
