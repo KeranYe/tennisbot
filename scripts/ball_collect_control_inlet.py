@@ -31,7 +31,13 @@ CALIB_FILE = "../data/camera_intrinsics_640x480_20cmfocus.npz"
 FRAME_W, FRAME_H = 640, 480
 MODEL_PATH = "/usr/share/imx500-models/imx500_network_ssd_mobilenetv2_fpnlite_320x320_pp.rpk"
 TARGET_LABELS = {"sports ball"}
-CONF_MIN = 0.10
+CONF_MIN = 0.30
+
+# Trajectory planner types
+TRAJECTORY_PLANNER_BEZIER = "bezier"  # Quadratic Bézier curve (default)
+TRAJECTORY_PLANNER_SHAPED = "shaped"  # Close-range approach shaping
+TRAJECTORY_PLANNER_DIRECT = "direct"  # Simple direct line to ball
+TRAJECTORY_PLANNER_ARC = "arc"  # Smooth arc trajectory
 
 
 class InletVisualController:
@@ -50,6 +56,7 @@ class InletVisualController:
         trajectory_waypoints=10,
         lookahead_steps=1,
         target_approach_distance=0.10,  # Stop 10cm from ball
+        trajectory_planner=TRAJECTORY_PLANNER_BEZIER,  # Default planner
     ):
         """
         Args:
@@ -61,6 +68,7 @@ class InletVisualController:
             trajectory_waypoints: Maximum number of trajectory waypoints to generate
             lookahead_steps: Number of trajectory steps to execute before replanning
             target_approach_distance: Desired distance to stop from ball (meters)
+            trajectory_planner: Type of trajectory planner to use (default: bezier)
         """
         self.chassis = chassis
         self.ball_finder = ball_finder
@@ -72,6 +80,7 @@ class InletVisualController:
         self.target_approach_distance = float(target_approach_distance)
         
         self.control_period = 1.0 / self.control_rate_hz
+        self.trajectory_planner = trajectory_planner
         self.ball_detected = False
         self.ball_pos_ballfinder = None  # Ball position from BallFinder frame
         self.ball_pos_chassis = None  # Ball position in chassis frame
@@ -107,7 +116,184 @@ class InletVisualController:
     
     def plan_trajectory(self, ball_pos_chassis):
         """
-        Plan a simple trajectory from inlet to ball position.
+        Plan trajectory from inlet to ball position using selected planner.
+        Dispatches to the appropriate planning method based on trajectory_planner type.
+        
+        Args:
+            ball_pos_chassis: Ball position in chassis frame [x, y, z]
+            
+        Returns:
+            List of waypoints in chassis frame, each [x, y, theta]
+        """
+        if ball_pos_chassis is None:
+            return []
+        
+        # Dispatch to appropriate planner
+        if self.trajectory_planner == TRAJECTORY_PLANNER_BEZIER:
+            return self._plan_trajectory_bezier(ball_pos_chassis)
+        elif self.trajectory_planner == TRAJECTORY_PLANNER_DIRECT:
+            return self._plan_trajectory_direct(ball_pos_chassis)
+        elif self.trajectory_planner == TRAJECTORY_PLANNER_ARC:
+            return self._plan_trajectory_arc(ball_pos_chassis)
+        elif self.trajectory_planner == TRAJECTORY_PLANNER_SHAPED:
+            return self._plan_trajectory_shaped(ball_pos_chassis)
+        else:
+            print(f"[WARNING] Unknown planner type '{self.trajectory_planner}', using bezier planner")
+            return self._plan_trajectory_bezier(ball_pos_chassis)
+    
+    def _plan_trajectory_bezier(self, ball_pos_chassis):
+        """
+        Quadratic Bézier curve trajectory from inlet to ball.
+        Control point is the projection of the midpoint onto the chassis x-axis.
+        
+        Args:
+            ball_pos_chassis: Ball position in chassis frame [x, y, z]
+            
+        Returns:
+            List of waypoints in chassis frame, each [x, y, theta]
+        """
+        inlet_pos_chassis = self.T_chassis_to_inlet[:3, 3]
+        ball_x, ball_y = ball_pos_chassis[0], ball_pos_chassis[1]
+        inlet_x, inlet_y = inlet_pos_chassis[0], inlet_pos_chassis[1]
+        
+        distance_to_ball = math.hypot(ball_x - inlet_x, ball_y - inlet_y)
+        
+        print(f"[DEBUG] Bézier trajectory: ball={fmt_cm(ball_pos_chassis)}, "
+              f"inlet={fmt_cm(inlet_pos_chassis)}, distance={distance_to_ball*100:.1f}cm")
+        
+        if distance_to_ball < 0.01:
+            return []
+        
+        # Bézier control points
+        P0 = np.array([inlet_x, inlet_y])  # Start: inlet
+        P2 = np.array([ball_x, ball_y])    # End: ball
+        
+        # Middle control point: project midpoint onto chassis x-axis (y=0)
+        midpoint_x = (inlet_x + ball_x) / 2.0
+        midpoint_y = (inlet_y + ball_y) / 2.0
+        P1 = np.array([midpoint_x, 0.0])  # Project onto x-axis
+        
+        print(f"[DEBUG] Bézier control points: P0={fmt_cm([P0[0], P0[1], 0])}, "
+              f"P1={fmt_cm([P1[0], P1[1], 0])}, P2={fmt_cm([P2[0], P2[1], 0])}")
+        
+        # Generate waypoints
+        min_waypoint_step_m = 0.015
+        waypoints_from_distance = max(1, int(distance_to_ball / min_waypoint_step_m))
+        num_waypoints = min(self.trajectory_waypoints, waypoints_from_distance)
+        
+        trajectory = []
+        for i in range(1, num_waypoints + 1):
+            t = i / num_waypoints
+            
+            # Quadratic Bézier formula: B(t) = (1-t)²P₀ + 2(1-t)tP₁ + t²P₂
+            one_minus_t = 1.0 - t
+            wp_pos = (one_minus_t * one_minus_t * P0 + 
+                     2.0 * one_minus_t * t * P1 + 
+                     t * t * P2)
+            
+            wp_x, wp_y = wp_pos[0], wp_pos[1]
+            
+            # Tangent direction: derivative of Bézier curve
+            # B'(t) = 2(1-t)(P₁-P₀) + 2t(P₂-P₁)
+            tangent = 2.0 * one_minus_t * (P1 - P0) + 2.0 * t * (P2 - P1)
+            wp_theta = math.atan2(tangent[1], tangent[0])
+            
+            trajectory.append([wp_x, wp_y, wp_theta])
+        
+        print(f"[DEBUG] Created Bézier trajectory with {len(trajectory)} waypoints")
+        return trajectory
+    
+    def _plan_trajectory_direct(self, ball_pos_chassis):
+        """
+        Simple direct line trajectory from inlet to ball.
+        
+        Args:
+            ball_pos_chassis: Ball position in chassis frame [x, y, z]
+            
+        Returns:
+            List of waypoints in chassis frame, each [x, y, theta]
+        """
+        inlet_pos_chassis = self.T_chassis_to_inlet[:3, 3]
+        ball_x, ball_y = ball_pos_chassis[0], ball_pos_chassis[1]
+        distance_to_ball = math.hypot(ball_x - inlet_pos_chassis[0], 
+                                       ball_y - inlet_pos_chassis[1])
+        
+        print(f"[DEBUG] Direct trajectory: ball={fmt_cm(ball_pos_chassis)}, "
+              f"inlet={fmt_cm(inlet_pos_chassis)}, distance={distance_to_ball*100:.1f}cm")
+        
+        if distance_to_ball < 0.01:
+            return []
+        
+        # Heading to ball
+        angle_to_ball = math.atan2(ball_y - inlet_pos_chassis[1], 
+                                    ball_x - inlet_pos_chassis[0])
+        
+        # Generate waypoints with minimum step size
+        min_waypoint_step_m = 0.015
+        waypoints_from_distance = max(1, int(distance_to_ball / min_waypoint_step_m))
+        num_waypoints = min(self.trajectory_waypoints, waypoints_from_distance)
+        
+        trajectory = []
+        for i in range(1, num_waypoints + 1):
+            alpha = i / num_waypoints
+            wp_x = inlet_pos_chassis[0] + (ball_x - inlet_pos_chassis[0]) * alpha
+            wp_y = inlet_pos_chassis[1] + (ball_y - inlet_pos_chassis[1]) * alpha
+            trajectory.append([wp_x, wp_y, angle_to_ball])
+        
+        print(f"[DEBUG] Created direct trajectory with {len(trajectory)} waypoints")
+        return trajectory
+    
+    def _plan_trajectory_arc(self, ball_pos_chassis):
+        """
+        Smooth arc trajectory from inlet to ball.
+        Uses a circular arc for smoother motion.
+        
+        Args:
+            ball_pos_chassis: Ball position in chassis frame [x, y, z]
+            
+        Returns:
+            List of waypoints in chassis frame, each [x, y, theta]
+        """
+        inlet_pos_chassis = self.T_chassis_to_inlet[:3, 3]
+        ball_x, ball_y = ball_pos_chassis[0], ball_pos_chassis[1]
+        distance_to_ball = math.hypot(ball_x - inlet_pos_chassis[0], 
+                                       ball_y - inlet_pos_chassis[1])
+        
+        print(f"[DEBUG] Arc trajectory: ball={fmt_cm(ball_pos_chassis)}, "
+              f"inlet={fmt_cm(inlet_pos_chassis)}, distance={distance_to_ball*100:.1f}cm")
+        
+        if distance_to_ball < 0.01:
+            return []
+        
+        # Direction angles
+        angle_to_ball = math.atan2(ball_y - inlet_pos_chassis[1], 
+                                    ball_x - inlet_pos_chassis[0])
+        
+        # Generate waypoints with smooth arc
+        min_waypoint_step_m = 0.015
+        waypoints_from_distance = max(1, int(distance_to_ball / min_waypoint_step_m))
+        num_waypoints = min(self.trajectory_waypoints, waypoints_from_distance)
+        
+        trajectory = []
+        for i in range(1, num_waypoints + 1):
+            alpha = i / num_waypoints
+            # Use smoothstep for acceleration/deceleration
+            smooth_alpha = alpha * alpha * (3.0 - 2.0 * alpha)
+            
+            wp_x = inlet_pos_chassis[0] + (ball_x - inlet_pos_chassis[0]) * smooth_alpha
+            wp_y = inlet_pos_chassis[1] + (ball_y - inlet_pos_chassis[1]) * smooth_alpha
+            
+            # Tangent angle along the path
+            wp_theta = angle_to_ball
+            trajectory.append([wp_x, wp_y, wp_theta])
+        
+        print(f"[DEBUG] Created arc trajectory with {len(trajectory)} waypoints")
+        return trajectory
+    
+    def _plan_trajectory_shaped(self, ball_pos_chassis):
+        """
+        Shaped trajectory with close-range approach constraints.
+        This is the original/default planner with special handling for nearby balls.
         
         Args:
             ball_pos_chassis: Ball position in chassis frame [x, y, z]
@@ -205,8 +391,28 @@ class InletVisualController:
             wp_theta = math.atan2(ball_y - inlet_pos_chassis[1], ball_x - inlet_pos_chassis[0])
             trajectory.append([wp_x, wp_y, wp_theta])
         
-        print(f"[DEBUG] Created trajectory with {len(trajectory)} waypoints")
+        print(f"[DEBUG] Created shaped trajectory with {len(trajectory)} waypoints")
         return trajectory
+    
+    def set_trajectory_planner(self, planner_type):
+        """
+        Change the trajectory planning method.
+        
+        Args:
+            planner_type: One of TRAJECTORY_PLANNER_* constants
+        """
+        valid_planners = [TRAJECTORY_PLANNER_BEZIER, TRAJECTORY_PLANNER_SHAPED, 
+                         TRAJECTORY_PLANNER_DIRECT, TRAJECTORY_PLANNER_ARC]
+        if planner_type not in valid_planners:
+            print(f"[WARNING] Invalid planner type '{planner_type}'. Valid options: {valid_planners}")
+            return
+        
+        self.trajectory_planner = planner_type
+        print(f"[INFO] Trajectory planner changed to: {planner_type}")
+        
+        # Clear existing trajectory to force replanning with new method
+        self.trajectory = []
+        self.current_traj_step = 0
     
     def compute_control(self):
         """
@@ -593,13 +799,49 @@ def main():
     )
     
     print("Visual controller initialized")
-    print("=== VISUALIZATION MODE: Robot will NOT move ===")
-    print("Controls: SPACE=start/stop planning, 'i'=toggle inlet visualization, 'q'=quit")
+    print(f"Trajectory planner: {controller.trajectory_planner}")
+    print("=== CONTROL MODES ===")
+    print("Controls:")
+    print("  SPACE = start/stop autonomous planning")
+    print("  'm' = toggle manual/auto control mode")
+    print("  'i' = toggle inlet on/off")
+    print("  'q' = quit")
+    print("  1-4 = select trajectory planner")
+    print("    1: Bézier curve (default)")
+    print("    2: Shaped approach")
+    print("    3: Direct line")
+    print("    4: Arc")
+    print("Manual keyboard control (when in manual mode):")
+    print("  UP/DOWN arrows = linear velocity +/- 0.01 m/s")
+    print("  LEFT/RIGHT arrows = angular velocity +/- 1 deg/s")
     print("Starting control loop...")
+
+    chassis.stop_event.clear()
+    chassis.run_event.clear()
+    motion_thread = threading.Thread(target=chassis.motionControlWorker, daemon=True)
+    motion_thread.start()
     
     # Control loop state
     running = False
     user_inlet_enabled = True  # User's inlet preference
+    manual_mode = False  # Manual keyboard control vs autonomous
+    
+    # Manual control state
+    manual_linear_vel = 0.0
+    manual_angular_vel = 0.0
+    key_linear_step = 0.01  # m/s increment per keypress (matching keyboad_input.py)
+    key_angular_step = 1.0  # deg/s increment per keypress (matching keyboad_input.py)
+
+    # Post-collection behavior: keep all motors on briefly after ball disappears
+    post_collect_duration_s = 1.0
+    post_collect_until = 0.0
+    post_collect_cooldown_s = 3.0  # Cooldown period to prevent repeated triggering
+    post_collect_cooldown_until = 0.0
+    prev_ball_detected = False
+    ball_detected_since = 0.0  # Timestamp when ball first detected
+    min_detection_duration_s = 1.5  # Minimum time ball must be detected to be considered real
+    last_motion_linear_cmd = 0.0
+    last_motion_angular_cmd = 0.0
     
     try:
         while True:
@@ -675,56 +917,187 @@ def main():
                 controller.update_ball_position(None)
                 with chassis.state_lock:
                     chassis.inlet_enabled = False  # No ball, turn off inlet
+
+            # Detect collection-like transition (ball was seen, then disappears)
+            current_time = time.monotonic()
             
-            # Compute control commands (but don't apply to robot)
-            linear_vel_cmd = 0.0
-            angular_vel_cmd = 0.0
-            inlet_active = False
+            # Track how long ball has been continuously detected
+            if controller.ball_detected and not prev_ball_detected:
+                # Ball just appeared
+                ball_detected_since = current_time
+            elif not controller.ball_detected and prev_ball_detected:
+                # Ball just disappeared - check if it was detected long enough
+                detection_duration = current_time - ball_detected_since
+                in_cooldown = current_time < post_collect_cooldown_until
+                ball_was_real = detection_duration >= min_detection_duration_s
+                
+                if ball_was_real and not in_cooldown:
+                    # Real ball was collected
+                    if abs(last_motion_linear_cmd) < 1e-3 and abs(last_motion_angular_cmd) < 1e-3:
+                        last_motion_linear_cmd = min(0.03, chassis.max_linear_vel)
+                        last_motion_angular_cmd = 0.0
+                    post_collect_until = current_time + post_collect_duration_s
+                    post_collect_cooldown_until = current_time + post_collect_cooldown_s
+                    print(f"[INFO] Ball collected (detected for {detection_duration:.2f}s): keeping motors on for {post_collect_duration_s:.1f}s")
+                elif not ball_was_real:
+                    print(f"[DEBUG] Ignoring brief detection ({detection_duration:.2f}s < {min_detection_duration_s:.1f}s threshold)")
+            
+            prev_ball_detected = controller.ball_detected
+            
+            # Compute control commands
+            planned_linear_vel = 0.0
+            planned_angular_vel = 0.0
             
             if running and controller.ball_detected:
-                linear_vel_cmd, angular_vel_cmd = controller.compute_control()
-                inlet_active = chassis.inlet_enabled
+                planned_linear_vel, planned_angular_vel = controller.compute_control()
             
-            # NOTE: Robot motion commands are NOT applied (visualization only)
+            # Determine actual commands to execute
+            in_post_collect = time.monotonic() < post_collect_until
+            if in_post_collect:
+                linear_vel_cmd = last_motion_linear_cmd
+                angular_vel_cmd = last_motion_angular_cmd
+                inlet_active = True
+                execute_motion = True
+            elif manual_mode:
+                # Manual mode: use keyboard commands
+                linear_vel_cmd = manual_linear_vel
+                angular_vel_cmd = math.radians(manual_angular_vel)
+                inlet_active = user_inlet_enabled and controller.ball_detected
+                execute_motion = True
+            else:
+                # Autonomous mode: execute planned trajectory when running
+                if running and controller.ball_detected:
+                    linear_vel_cmd = planned_linear_vel
+                    angular_vel_cmd = planned_angular_vel
+                    inlet_active = user_inlet_enabled and controller.ball_detected
+                    execute_motion = True
+                else:
+                    linear_vel_cmd = 0.0
+                    angular_vel_cmd = 0.0
+                    inlet_active = False
+                    execute_motion = False
+
+            if execute_motion and not in_post_collect:
+                last_motion_linear_cmd = linear_vel_cmd
+                last_motion_angular_cmd = angular_vel_cmd
+            
+            # Apply commands to robot through motion worker thread
+            with chassis.state_lock:
+                chassis.linear_vel_cmd = linear_vel_cmd
+                chassis.angular_vel_cmd = angular_vel_cmd
+                chassis.inlet_enabled = inlet_active
+
+            if execute_motion:
+                chassis.run_event.set()
+            else:
+                chassis.run_event.clear()
             
             # Visualization
             frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
             controller.draw_trajectory_on_frame(frame_bgr, ball_pixel_pos)
             
             # Status overlay
-            status_color = (0, 255, 0) if running else (128, 128, 128)
-            status_text = "RUNNING" if running else "STOPPED"
-            cv2.putText(frame_bgr, status_text, (FRAME_W - 120, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+            # Control mode
+            mode_text = "MANUAL" if manual_mode else ("AUTO:RUNNING" if running else "AUTO:STOPPED")
+            mode_color = (0, 255, 255) if manual_mode else ((0, 255, 0) if running else (128, 128, 128))
+            cv2.putText(frame_bgr, mode_text, (FRAME_W - 180, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, mode_color, 2)
+            
+            # Display current planner type
+            planner_display = f"Planner: {controller.trajectory_planner.upper()}"
+            cv2.putText(frame_bgr, planner_display, (FRAME_W - 180, 60),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 180, 100), 2)
             
             # Control signal display
-            ctrl_y = FRAME_H - 110
-            cv2.putText(frame_bgr, "Control Signals (NOT applied to robot):", (10, ctrl_y),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 100), 1)
+            ctrl_y = FRAME_H - 130
+            
+            # Display planned trajectory commands (always calculated)
+            cv2.putText(frame_bgr, "Planned (trajectory):", (10, ctrl_y),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            ctrl_y += 18
+            cv2.putText(frame_bgr, f"  Lin: {planned_linear_vel:+.3f} m/s  Ang: {math.degrees(planned_angular_vel):+.1f} deg/s", (10, ctrl_y),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
             ctrl_y += 22
-            cv2.putText(frame_bgr, f"Linear:  {linear_vel_cmd:+.3f} m/s", (10, ctrl_y),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            ctrl_y += 20
-            cv2.putText(frame_bgr, f"Angular: {math.degrees(angular_vel_cmd):+.2f} deg/s", (10, ctrl_y),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            
+            # Display actual commands being executed
+            if manual_mode:
+                cmd_label = "Executing (manual):"
+                cmd_color = (0, 255, 255)
+            elif in_post_collect:
+                cmd_label = "Executing (collect+1s):"
+                cmd_color = (0, 200, 255)
+            elif execute_motion:
+                cmd_label = "Executing (auto):"
+                cmd_color = (0, 255, 0)
+            else:
+                cmd_label = "Executing (off):"
+                cmd_color = (128, 128, 128)
+            cv2.putText(frame_bgr, cmd_label, (10, ctrl_y),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, cmd_color, 1)
+            ctrl_y += 18
+            cv2.putText(frame_bgr, f"  Lin: {linear_vel_cmd:+.3f} m/s  Ang: {math.degrees(angular_vel_cmd):+.1f} deg/s", (10, ctrl_y),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
             ctrl_y += 20
             inlet_text = "ON" if inlet_active else "OFF"
             inlet_color = (0, 255, 0) if inlet_active else (128, 128, 128)
-            cv2.putText(frame_bgr, f"Inlet:   {inlet_text}", (10, ctrl_y),
+            cv2.putText(frame_bgr, f"Inlet: {inlet_text}", (10, ctrl_y),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, inlet_color, 1)
             
             cv2.imshow("Ball Collection Control", frame_bgr)
             
             # Keyboard input
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
+            key = cv2.waitKey(1)
+            
+            # Handle regular keys (ASCII)
+            key_char = key & 0xFF
+            if key_char == ord('q'):
                 break
-            elif key == ord(' '):
+            elif key_char == ord(' '):
                 running = not running
-                print(f"Planning: {'RUNNING' if running else 'STOPPED'}")
-            elif key == ord('i'):
+                print(f"Autonomous planning: {'RUNNING' if running else 'STOPPED'}")
+            elif key_char == ord('m'):
+                manual_mode = not manual_mode
+                if manual_mode:
+                    print("Switched to MANUAL control mode (arrow keys to drive)")
+                    manual_linear_vel = 0.0
+                    manual_angular_vel = 0.0
+                    chassis.run_event.set()
+                else:
+                    print("Switched to AUTONOMOUS mode (robot stopped)")
+                    chassis.run_event.clear()
+                    # Stop robot when exiting manual mode
+                    with chassis.state_lock:
+                        chassis.linear_vel_cmd = 0.0
+                        chassis.angular_vel_cmd = 0.0
+                        chassis.inlet_enabled = False
+            elif key_char == ord('i'):
                 user_inlet_enabled = not user_inlet_enabled
-                print(f"Inlet visualization: {'ON' if user_inlet_enabled else 'OFF'}")
+                print(f"Inlet: {'ON' if user_inlet_enabled else 'OFF'}")
+            elif key_char == ord('1'):
+                controller.set_trajectory_planner(TRAJECTORY_PLANNER_BEZIER)
+            elif key_char == ord('2'):
+                controller.set_trajectory_planner(TRAJECTORY_PLANNER_SHAPED)
+            elif key_char == ord('3'):
+                controller.set_trajectory_planner(TRAJECTORY_PLANNER_DIRECT)
+            elif key_char == ord('4'):
+                controller.set_trajectory_planner(TRAJECTORY_PLANNER_ARC)
+            
+            # Manual control with arrow keys (only active in manual mode)
+            # Arrow key codes on Linux: UP=82, DOWN=84, LEFT=81, RIGHT=83 (when used with 0xFF00 mask)
+            if manual_mode and key != -1:
+                # Check for arrow keys (extended codes)
+                if key == 82 or key == 2490368:  # UP arrow
+                    manual_linear_vel = min(chassis.max_linear_vel, manual_linear_vel + key_linear_step)
+                    print(f"Manual: linear velocity = {manual_linear_vel:.3f} m/s")
+                elif key == 84 or key == 2621440:  # DOWN arrow
+                    manual_linear_vel = max(-chassis.max_linear_vel, manual_linear_vel - key_linear_step)
+                    print(f"Manual: linear velocity = {manual_linear_vel:.3f} m/s")
+                elif key == 81 or key == 2424832:  # LEFT arrow
+                    manual_angular_vel = min(chassis.max_angular_vel_deg, manual_angular_vel + key_angular_step)
+                    print(f"Manual: angular velocity = {manual_angular_vel:.1f} deg/s")
+                elif key == 83 or key == 2555904:  # RIGHT arrow
+                    manual_angular_vel = max(-chassis.max_angular_vel_deg, manual_angular_vel - key_angular_step)
+                    print(f"Manual: angular velocity = {manual_angular_vel:.1f} deg/s")
             
             # Maintain control rate
             elapsed = time.monotonic() - loop_start
@@ -737,7 +1110,16 @@ def main():
     
     finally:
         print("Shutting down...")
-        # No robot commands needed (visualization only)
+        chassis.run_event.clear()
+        chassis.stop_event.set()
+        # Stop robot motion
+        with chassis.state_lock:
+            chassis.linear_vel_cmd = 0.0
+            chassis.angular_vel_cmd = 0.0
+            chassis.inlet_enabled = False
+        time.sleep(0.1)
+        if 'motion_thread' in locals() and motion_thread.is_alive():
+            motion_thread.join(timeout=1.0)
         picam2.stop()
         cv2.destroyAllWindows()
         portHandler.closePort()
