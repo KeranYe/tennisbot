@@ -22,7 +22,7 @@ CALIB_FILE = "../data/camera_intrinsics_640x480_20cmfocus.npz"
 FRAME_W, FRAME_H = 640, 480  # MUST match calibration resolution (or scale intrinsics)
 
 # Geometry
-CAMERA_HEIGHT_M = 0.26              # <-- you said ~26 cm above ground
+CAMERA_HEIGHT_M = 0.306            # <-- you said ~30.6 cm above ground
 CAMERA_PITCH_DEG = 90.0             # pitch DOWN from horizontal: 0=horizontal, 90=straight down
 BALL_DIAMETER_M = 0.067             # tennis ball
 BALL_RADIUS_M = BALL_DIAMETER_M / 2.0

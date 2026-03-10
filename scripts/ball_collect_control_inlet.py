@@ -736,22 +736,22 @@ def main():
         wheel_reduction=1,
         inlet_reduction=0.1,
         max_linear_vel=0.225,  # 1.5x faster for visual servoing
-        max_angular_vel_deg=45,  # 1.5x faster angular velocity
-        max_inlet_vel=3.0
+        max_angular_vel_deg=60,  # 1.5x faster angular velocity
+        max_inlet_vel=4.5
     )
     
     # Transformation matrices (ADJUST THESE FOR YOUR ROBOT)
     # Example: Camera mounted 10cm forward, 0cm lateral, 26cm up from chassis center
     T_chassis_to_camera = np.array([
-        [1, 0, 0, 0.10],  # Camera 10cm forward
+        [1, 0, 0, 0.0866],  # Camera 10cm forward
         [0, 1, 0, 0.00],  # Camera at center laterally
-        [0, 0, 1, 0.26],  # Camera 26cm above ground
+        [0, 0, 1, 0.306],  # Camera 30.6cm above ground
         [0, 0, 0, 1]
     ], dtype=np.float64)
     
     # Inlet in front of camera (so it's visible in camera view)
     T_chassis_to_inlet = np.array([
-        [1, 0, 0, 0.05],  # Inlet 5cm forward (5cm behind of camera)
+        [1, 0, 0, -0.032],  # Inlet 5cm forward (5cm behind of camera)
         [0, 1, 0, 0.00],  # Inlet at center
         [0, 0, 1, 0.00],  # Inlet at ground level
         [0, 0, 0, 1]
