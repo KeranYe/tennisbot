@@ -821,6 +821,7 @@ def main():
     print("  SPACE = start/stop autonomous planning")
     print("  'm' = toggle manual/auto control mode")
     print("  'i' = toggle inlet on/off")
+    print("  'r' = reset collected ball counter")
     print("  'q' = quit")
     print("  1-4 = select trajectory planner")
     print("    1: Bézier curve (default)")
@@ -856,8 +857,11 @@ def main():
     prev_ball_detected = False
     ball_detected_since = 0.0  # Timestamp when ball first detected
     min_detection_duration_s = 1.5  # Minimum time ball must be detected to be considered real
+    collect_near_inlet_distance_m = 0.07  # Count as collected if ball center gets this close to inlet
+    episode_min_ball_inlet_distance_m = float('inf')
     last_motion_linear_cmd = 0.0
     last_motion_angular_cmd = 0.0
+    balls_collected_count = 0
     
     try:
         while True:
@@ -941,22 +945,45 @@ def main():
             if controller.ball_detected and not prev_ball_detected:
                 # Ball just appeared
                 ball_detected_since = current_time
+                episode_min_ball_inlet_distance_m = float('inf')
+            elif controller.ball_detected:
+                # Track closest approach to inlet during this detection episode
+                if controller.ball_pos_chassis is not None:
+                    inlet_pos = controller.T_chassis_to_inlet[:3, 3]
+                    distance_to_inlet = math.hypot(
+                        controller.ball_pos_chassis[0] - inlet_pos[0],
+                        controller.ball_pos_chassis[1] - inlet_pos[1],
+                    )
+                    episode_min_ball_inlet_distance_m = min(
+                        episode_min_ball_inlet_distance_m,
+                        distance_to_inlet,
+                    )
             elif not controller.ball_detected and prev_ball_detected:
                 # Ball just disappeared - check if it was detected long enough
                 detection_duration = current_time - ball_detected_since
                 in_cooldown = current_time < post_collect_cooldown_until
-                ball_was_real = detection_duration >= min_detection_duration_s
+                near_inlet_capture = episode_min_ball_inlet_distance_m <= collect_near_inlet_distance_m
+                ball_was_real = (detection_duration >= min_detection_duration_s) or near_inlet_capture
                 
                 if ball_was_real and not in_cooldown:
                     # Real ball was collected
+                    balls_collected_count += 1
                     if abs(last_motion_linear_cmd) < 1e-3 and abs(last_motion_angular_cmd) < 1e-3:
                         last_motion_linear_cmd = min(0.03, chassis.max_linear_vel)
                         last_motion_angular_cmd = 0.0
                     post_collect_until = current_time + post_collect_duration_s
                     post_collect_cooldown_until = current_time + post_collect_cooldown_s
-                    print(f"[INFO] Ball collected (detected for {detection_duration:.2f}s): keeping motors on for {post_collect_duration_s:.1f}s")
+                    print(
+                        f"[INFO] Ball collected #{balls_collected_count} "
+                        f"(detected for {detection_duration:.2f}s, min inlet dist={episode_min_ball_inlet_distance_m*100:.1f}cm): "
+                        f"keeping motors on for {post_collect_duration_s:.1f}s"
+                    )
                 elif not ball_was_real:
-                    print(f"[DEBUG] Ignoring brief detection ({detection_duration:.2f}s < {min_detection_duration_s:.1f}s threshold)")
+                    print(
+                        f"[DEBUG] Ignoring brief/far detection "
+                        f"({detection_duration:.2f}s < {min_detection_duration_s:.1f}s and "
+                        f"min inlet dist {episode_min_ball_inlet_distance_m*100:.1f}cm > {collect_near_inlet_distance_m*100:.1f}cm)"
+                    )
             
             prev_ball_detected = controller.ball_detected
             
@@ -1023,6 +1050,11 @@ def main():
             planner_display = f"Planner: {controller.trajectory_planner.upper()}"
             cv2.putText(frame_bgr, planner_display, (FRAME_W - 180, 60),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 180, 100), 2)
+
+            # Display collected ball count (session)
+            count_display = f"Collected: {balls_collected_count}"
+            cv2.putText(frame_bgr, count_display, (FRAME_W - 180, 90),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
             
             # Control signal display
             ctrl_y = FRAME_H - 130
@@ -1097,6 +1129,9 @@ def main():
                 controller.set_trajectory_planner(TRAJECTORY_PLANNER_DIRECT)
             elif key_char == ord('4'):
                 controller.set_trajectory_planner(TRAJECTORY_PLANNER_ARC)
+            elif key_char == ord('r'):
+                balls_collected_count = 0
+                print("Ball counter reset to 0")
             
             # Manual control with arrow keys (only active in manual mode)
             # Arrow key codes on Linux: UP=82, DOWN=84, LEFT=81, RIGHT=83 (when used with 0xFF00 mask)
