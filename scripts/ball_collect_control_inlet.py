@@ -710,6 +710,12 @@ def main():
         choices=[0, 1],
         help="Camera source: 0 (CSI 0) or 1 (CSI 1) (default: 1)"
     )
+    parser.add_argument(
+        "--search-scan-angle-deg",
+        type=float,
+        default=180.0,
+        help="Search mode sweep angle when no ball is detected (default: 180 deg)",
+    )
     args = parser.parse_args()
     
     # Initialize servo communication
@@ -839,6 +845,7 @@ def main():
     print("  SPACE = start/stop autonomous planning")
     print("  'm' = toggle manual/auto control mode")
     print("  'i' = toggle inlet on/off")
+    print("  's' = toggle search scan mode (auto sweep when no ball)")
     print("  'r' = reset collected ball counter")
     print("  'q' = quit")
     print("  1-4 = select trajectory planner")
@@ -862,6 +869,18 @@ def main():
     running = False
     user_inlet_enabled = True  # User's inlet preference
     manual_mode = False  # Manual keyboard control vs autonomous
+
+    # Optional search scan mode (toggle with 's')
+    search_scan_enabled = False
+    search_scan_angle_deg = max(1.0, float(args.search_scan_angle_deg))
+    search_scan_speed_deg_s = 40.0
+    search_scan_direction = 1.0
+    search_scan_active = False
+    search_scan_start_time = 0.0
+    search_scan_duration_s = search_scan_angle_deg / search_scan_speed_deg_s
+    search_scan_max_sweeps = 2
+    search_scan_completed_sweeps = 0
+    search_scan_exhausted = False
     
     # Manual control state
     manual_linear_vel = 0.0
@@ -1030,11 +1049,61 @@ def main():
             else:
                 # Autonomous mode: execute planned trajectory when running
                 if running and controller.ball_detected:
+                    if search_scan_active:
+                        print("[INFO] Ball detected during search: switching to inlet tracking")
+                    search_scan_active = False
+                    search_scan_completed_sweeps = 0
+                    search_scan_exhausted = False
                     linear_vel_cmd = planned_linear_vel
                     angular_vel_cmd = planned_angular_vel
                     inlet_active = user_inlet_enabled and controller.ball_detected
                     execute_motion = True
+                elif running and search_scan_enabled:
+                    # Search scan mode: sweep by configured angle, alternating direction each sweep
+                    now = time.monotonic()
+                    if search_scan_exhausted:
+                        linear_vel_cmd = 0.0
+                        angular_vel_cmd = 0.0
+                        inlet_active = False
+                        execute_motion = False
+                    elif not search_scan_active:
+                        search_scan_active = True
+                        search_scan_start_time = now
+                        print(
+                            f"[INFO] Search sweep start: angle={search_scan_angle_deg:.1f}deg, "
+                            f"direction={'CCW' if search_scan_direction > 0 else 'CW'}"
+                        )
+
+                    sweep_elapsed = now - search_scan_start_time
+                    if sweep_elapsed >= search_scan_duration_s:
+                        search_scan_completed_sweeps += 1
+                        if search_scan_completed_sweeps >= search_scan_max_sweeps:
+                            search_scan_active = False
+                            search_scan_exhausted = True
+                            print(
+                                f"[INFO] Search stopped: no ball detected after {search_scan_completed_sweeps} sweeps"
+                            )
+                            linear_vel_cmd = 0.0
+                            angular_vel_cmd = 0.0
+                            inlet_active = False
+                            execute_motion = False
+                        else:
+                            search_scan_direction *= -1.0
+                            search_scan_start_time = now
+                            print(
+                                f"[INFO] Search sweep reverse: direction={'CCW' if search_scan_direction > 0 else 'CW'} "
+                                f"({search_scan_completed_sweeps}/{search_scan_max_sweeps})"
+                            )
+
+                    if not search_scan_exhausted:
+                        linear_vel_cmd = 0.0
+                        angular_vel_cmd = math.radians(search_scan_speed_deg_s * search_scan_direction)
+                        inlet_active = False
+                        execute_motion = True
                 else:
+                    search_scan_active = False
+                    search_scan_completed_sweeps = 0
+                    search_scan_exhausted = False
                     linear_vel_cmd = 0.0
                     angular_vel_cmd = 0.0
                     inlet_active = False
@@ -1065,6 +1134,11 @@ def main():
             mode_color = (0, 255, 255) if manual_mode else ((0, 255, 0) if running else (128, 128, 128))
             cv2.putText(frame_bgr, mode_text, (FRAME_W - 180, 30),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, mode_color, 2)
+
+            scan_text = f"Search: {'ON' if search_scan_enabled else 'OFF'}"
+            scan_color = (0, 200, 255) if search_scan_enabled else (128, 128, 128)
+            cv2.putText(frame_bgr, scan_text, (FRAME_W - 180, 120),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.55, scan_color, 2)
             
             # Display current planner type
             planner_display = f"Planner: {controller.trajectory_planner.upper()}"
@@ -1159,6 +1233,10 @@ def main():
                 break
             elif key_char == ord(' '):
                 running = not running
+                if not running:
+                    search_scan_active = False
+                search_scan_completed_sweeps = 0
+                search_scan_exhausted = False
                 print(f"Autonomous planning: {'RUNNING' if running else 'STOPPED'}")
             elif key_char == ord('m'):
                 manual_mode = not manual_mode
@@ -1178,6 +1256,15 @@ def main():
             elif key_char == ord('i'):
                 user_inlet_enabled = not user_inlet_enabled
                 print(f"Inlet: {'ON' if user_inlet_enabled else 'OFF'}")
+            elif key_char == ord('s'):
+                search_scan_enabled = not search_scan_enabled
+                search_scan_active = False
+                search_scan_completed_sweeps = 0
+                search_scan_exhausted = False
+                print(
+                    f"Search scan mode: {'ON' if search_scan_enabled else 'OFF'} "
+                    f"(sweep angle={search_scan_angle_deg:.1f}deg)"
+                )
             elif key_char == ord('1'):
                 controller.set_trajectory_planner(TRAJECTORY_PLANNER_BEZIER)
             elif key_char == ord('2'):
