@@ -33,7 +33,8 @@ def main():
     ap.add_argument("--width", type=int, default=1280, help="Camera capture width.")
     ap.add_argument("--height", type=int, default=720, help="Camera capture height.")
     ap.add_argument("--fps", type=int, default=30, help="Camera FPS.")
-    ap.add_argument("--imgsz", type=int, default=640, help="Inference image size (smaller is faster).")
+    ap.add_argument("--imgsz", type=int, default=416,
+                    help="Inference image size (smaller is faster; typically match export --imgsz).")
     ap.add_argument("--conf", type=float, default=0.35, help="Confidence threshold.")
     ap.add_argument("--max_det", type=int, default=10, help="Max detections per frame.")
     ap.add_argument("--display", action="store_true", help="Show annotated window.")
