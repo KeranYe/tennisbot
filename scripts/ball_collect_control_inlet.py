@@ -786,6 +786,24 @@ def main():
     time.sleep(0.5)
     
     print("Camera initialized")
+
+    # Initialize optional long-range camera preview (always CSI0 when primary is not CSI0)
+    picam2_csi0 = None
+    csi0_preview_error_reported = False
+    if args.camera != 0:
+        try:
+            picam2_csi0 = Picamera2(0)
+            config_csi0 = picam2_csi0.create_preview_configuration(
+                main={"size": (FRAME_W, FRAME_H), "format": "RGB888"},
+                buffer_count=4,
+            )
+            picam2_csi0.configure(config_csi0)
+            picam2_csi0.start()
+            time.sleep(0.2)
+            print("Long-range camera preview initialized on CSI0")
+        except Exception as exc:
+            print(f"[WARNING] Could not initialize CSI0 long-range preview: {exc}")
+            picam2_csi0 = None
     
     # Initialize BallFinder
     ball_finder = BallFinder(
@@ -831,6 +849,8 @@ def main():
     print("Manual keyboard control (when in manual mode):")
     print("  UP/DOWN arrows = linear velocity +/- 0.01 m/s")
     print("  LEFT/RIGHT arrows = angular velocity +/- 1 deg/s")
+    if picam2_csi0 is not None:
+        print("Dual-view display enabled: main + long-range camera (CSI0)")
     print("Starting control loop...")
 
     chassis.stop_event.clear()
@@ -1091,7 +1111,44 @@ def main():
             cv2.putText(frame_bgr, f"Inlet: {inlet_text}", (10, ctrl_y),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, inlet_color, 1)
             
-            cv2.imshow("Ball Collection Control", frame_bgr)
+            # Compose single display window with side-by-side camera views
+            display_frame = frame_bgr
+
+            if picam2_csi0 is not None:
+                try:
+                    frame_csi0_rgb = picam2_csi0.capture_array("main")
+                    frame_csi0_bgr = cv2.cvtColor(frame_csi0_rgb, cv2.COLOR_RGB2BGR)
+                    if frame_csi0_bgr.shape[0] != FRAME_H or frame_csi0_bgr.shape[1] != FRAME_W:
+                        frame_csi0_bgr = cv2.resize(frame_csi0_bgr, (FRAME_W, FRAME_H), interpolation=cv2.INTER_LINEAR)
+
+                    cv2.putText(
+                        frame_csi0_bgr,
+                        "Long Range (CSI0)",
+                        (10, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (0, 255, 255),
+                        2,
+                    )
+                    cv2.putText(
+                        frame_bgr,
+                        f"Control View (CSI{args.camera})",
+                        (10, FRAME_H - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (255, 255, 255),
+                        2,
+                    )
+
+                    display_frame = np.hstack((frame_bgr, frame_csi0_bgr))
+                    cv2.line(display_frame, (FRAME_W, 0), (FRAME_W, FRAME_H - 1), (255, 255, 255), 2)
+                except Exception as exc:
+                    if not csi0_preview_error_reported:
+                        print(f"[WARNING] CSI0 preview capture failed, disabling preview: {exc}")
+                        csi0_preview_error_reported = True
+                    picam2_csi0 = None
+
+            cv2.imshow("Ball Collection Control", display_frame)
             
             # Keyboard input
             key = cv2.waitKey(1)
@@ -1172,6 +1229,8 @@ def main():
         if 'motion_thread' in locals() and motion_thread.is_alive():
             motion_thread.join(timeout=1.0)
         picam2.stop()
+        if 'picam2_csi0' in locals() and picam2_csi0 is not None:
+            picam2_csi0.stop()
         cv2.destroyAllWindows()
         portHandler.closePort()
         print("Done")
