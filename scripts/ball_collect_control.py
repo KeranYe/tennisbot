@@ -40,9 +40,10 @@ TARGET_LABELS = {"sports ball"}
 CONF_MIN = 0.30
 FAR_NCNN_MODEL_PATH = "../yolo_models/yolo26n_480_ncnn_model"
 FAR_NCNN_IMG_SIZE = 480
-FAR_NCNN_CONF = 0.35
+FAR_NCNN_CONF = 0.20
 FAR_CSI0_HFOV_DEG = 66.0
 FAR_APPROACH_TURN_SIGN = -1.0  # Use -1 if steering appears flipped
+FAR_BALL_DIAMETER_M = 0.067
 
 
 def find_class_id(model, class_name):
@@ -722,6 +723,359 @@ class InletVisualController:
         return frame
 
 
+class LongRangeSearchApproachController:
+    """Owns long-range search/approach state machine and command generation."""
+
+    def __init__(self, search_scan_angle_deg=360.0, far_detector_ready=False):
+        self.search_scan_enabled = True
+        self.search_scan_angle_deg = max(1.0, float(search_scan_angle_deg))
+        self.search_scan_speed_deg_s = 40.0
+        self.search_scan_far_speed_deg_s = 20.0
+        self.search_scan_far_detect_slowdown_factor = 0.2
+        self.search_scan_far_detect_slowdown_hold_s = 0.8
+        self.search_scan_far_detect_slowdown_until = 0.0
+        self.search_scan_far_detect_confirm_frames = 1
+        self.search_scan_far_detect_streak = 0
+        self.search_scan_direction = 1.0
+        self.search_scan_active = False
+        self.search_scan_start_time = 0.0
+        self.search_scan_duration_s = self.search_scan_angle_deg / self.search_scan_speed_deg_s
+        self.search_scan_max_sweeps = 2
+        self.search_scan_far_max_sweeps = 2
+        self.search_scan_completed_sweeps = 0
+        self.search_scan_exhausted = False
+        self.search_scan_phase = "normal"  # normal -> wait_far -> far -> far_wait_cycle -> far ... or far_approach
+        self.search_scan_far_wait_s = 1.0
+        self.search_scan_far_wait_until = 0.0
+        self.search_scan_far_cycle_wait_s = 5.0
+        self.search_scan_far_cycle_wait_until = 0.0
+        self.search_scan_far_cycle_count = 0
+        self.search_scan_far_max_cycles = 3
+        self.far_recover_forward_s = 1.0
+        self.far_recover_forward_linear_vel = 0.05
+        self.far_recover_forward_until = 0.0
+
+        self.far_detector_ready = bool(far_detector_ready)
+        self.far_target_last_bearing_deg = None
+        self.far_target_last_direction_text = ""
+        self.far_approach_linear_vel = 0.06
+        self.far_approach_kp_angular = 2.2  # deg/s per deg bearing error
+        self.far_approach_max_angular_deg_s = 35.0
+        self.far_approach_center_tolerance_deg = 4.0
+        self.far_approach_lost_spin_deg_s = 0.0
+        self.far_target_lock_active = False
+        self.far_target_lock_px = None
+        self.far_target_lock_bearing_deg = None
+        self.far_target_lock_conf = 0.0
+        self.far_target_lost_frames = 0
+        self.far_target_match_max_px = 80.0
+        self.far_target_max_lost_frames = 10
+        self.far_target_retarget_period_s = 0.5
+        self.far_target_retarget_next_time = 0.0
+        self.far_target_retarget_xproj_hysteresis_m = 0.12
+
+    def _get_current_sweep_speed_deg_s(self, now=None):
+        if self.search_scan_phase == "far":
+            speed = self.search_scan_far_speed_deg_s
+            if now is None:
+                now = time.monotonic()
+            if now < self.search_scan_far_detect_slowdown_until:
+                speed *= self.search_scan_far_detect_slowdown_factor
+            return speed
+        return self.search_scan_speed_deg_s
+
+    def _get_current_sweep_duration_s(self, now=None):
+        current_speed = self._get_current_sweep_speed_deg_s(now=now)
+        return self.search_scan_angle_deg / max(1e-6, current_speed)
+
+    def set_far_detector_ready(self, ready):
+        self.far_detector_ready = bool(ready)
+
+    def clear_target_lock(self):
+        self.far_target_lock_active = False
+        self.far_target_lock_px = None
+        self.far_target_lock_bearing_deg = None
+        self.far_target_lock_conf = 0.0
+        self.far_target_lost_frames = 0
+        self.far_target_retarget_next_time = 0.0
+
+    def reset_search_cycle(self):
+        self.search_scan_active = False
+        self.search_scan_completed_sweeps = 0
+        self.search_scan_exhausted = False
+        self.search_scan_phase = "normal"
+        self.search_scan_far_cycle_count = 0
+        self.search_scan_far_detect_slowdown_until = 0.0
+        self.search_scan_far_detect_streak = 0
+        self.far_recover_forward_until = 0.0
+
+    def on_autonomy_toggled(self, running):
+        if not running:
+            self.search_scan_active = False
+            self.clear_target_lock()
+        self.search_scan_completed_sweeps = 0
+        self.search_scan_exhausted = False
+        self.search_scan_phase = "normal"
+        self.search_scan_far_detect_slowdown_until = 0.0
+        self.search_scan_far_detect_streak = 0
+        self.far_recover_forward_until = 0.0
+
+    def toggle_search_scan(self):
+        self.search_scan_enabled = not self.search_scan_enabled
+        self.search_scan_active = False
+        self.clear_target_lock()
+        self.search_scan_completed_sweeps = 0
+        self.search_scan_exhausted = False
+        self.search_scan_phase = "normal"
+        self.search_scan_far_detect_slowdown_until = 0.0
+        self.search_scan_far_detect_streak = 0
+        self.far_recover_forward_until = 0.0
+        return self.search_scan_enabled
+
+    def on_inlet_ball_detected(self):
+        if self.search_scan_phase in ("wait_far", "far", "far_approach") or self.search_scan_active:
+            print("[INFO] Ball detected in inlet camera: switching to inlet tracking")
+        self.clear_target_lock()
+        self.reset_search_cycle()
+
+    def compute_commands(
+        self,
+        running,
+        ball_detected,
+        user_inlet_enabled,
+        planned_linear_vel,
+        planned_angular_vel,
+        far_ball_detected,
+        far_ball_center_px,
+        far_ball_bearing_deg,
+        far_ball_best_conf,
+        far_ball_direction_text,
+        chassis_max_linear_vel,
+    ):
+        """
+        Compute autonomous commands with long-range search/approach state machine.
+
+        Returns:
+            (linear_vel_cmd, angular_vel_cmd, inlet_active, execute_motion)
+        """
+        if running and ball_detected:
+            self.on_inlet_ball_detected()
+            return planned_linear_vel, planned_angular_vel, (user_inlet_enabled and ball_detected), True
+
+        if not (running and self.search_scan_enabled):
+            self.reset_search_cycle()
+            return 0.0, 0.0, False, False
+
+        now = time.monotonic()
+
+        # Immediate handoff: if inlet camera loses ball but long-range camera sees one,
+        # switch straight to FAR approach using the long-range target.
+        if (not ball_detected) and far_ball_detected:
+            if self.search_scan_phase != "far_approach":
+                print(
+                    f"[INFO] Inlet lost ball, FAR target available: switching to FAR approach "
+                    f"(bearing={far_ball_bearing_deg:+.1f}deg {far_ball_direction_text})"
+                )
+            self.search_scan_phase = "far_approach"
+            self.search_scan_active = False
+            self.search_scan_exhausted = False
+            self.search_scan_completed_sweeps = 0
+            self.search_scan_far_cycle_count = 0
+            self.far_target_lock_active = True
+            self.far_target_lock_px = far_ball_center_px
+            self.far_target_lock_bearing_deg = far_ball_bearing_deg
+            self.far_target_lock_conf = far_ball_best_conf
+            self.far_target_lost_frames = 0
+            if self.far_target_retarget_next_time <= 0.0:
+                self.far_target_retarget_next_time = now + self.far_target_retarget_period_s
+
+        if self.search_scan_phase == "done":
+            self.search_scan_exhausted = True
+            self.clear_target_lock()
+            return 0.0, 0.0, False, False
+
+        if self.search_scan_phase == "far_recover_forward":
+            if now < self.far_recover_forward_until:
+                linear_vel_cmd = min(self.far_recover_forward_linear_vel, chassis_max_linear_vel)
+                return linear_vel_cmd, 0.0, False, True
+
+            # Recovery complete: resume FAR search sweeping
+            self.search_scan_phase = "far"
+            self.search_scan_active = False
+            self.search_scan_exhausted = False
+            self.search_scan_completed_sweeps = 0
+            self.search_scan_far_detect_slowdown_until = 0.0
+            self.search_scan_far_detect_streak = 0
+            self.clear_target_lock()
+            print("[INFO] FAR recovery forward complete: resuming FAR search")
+            return 0.0, 0.0, False, False
+
+        if self.search_scan_phase == "far_approach":
+            if not far_ball_detected:
+                self.search_scan_phase = "far_recover_forward"
+                self.far_recover_forward_until = now + self.far_recover_forward_s
+                self.clear_target_lock()
+                print(
+                    f"[INFO] FAR target lost: moving forward for {self.far_recover_forward_s:.1f}s, then resuming FAR search"
+                )
+                linear_vel_cmd = min(self.far_recover_forward_linear_vel, chassis_max_linear_vel)
+                return linear_vel_cmd, 0.0, False, True
+
+            bearing_for_control = far_ball_bearing_deg
+            if bearing_for_control is not None:
+                angular_cmd_deg_s = FAR_APPROACH_TURN_SIGN * self.far_approach_kp_angular * bearing_for_control
+                angular_cmd_deg_s = max(
+                    -self.far_approach_max_angular_deg_s,
+                    min(self.far_approach_max_angular_deg_s, angular_cmd_deg_s),
+                )
+                if abs(bearing_for_control) <= self.far_approach_center_tolerance_deg:
+                    linear_vel_cmd = min(self.far_approach_linear_vel, chassis_max_linear_vel)
+                else:
+                    # Keep approaching (reduced speed) instead of spin-in-place.
+                    linear_vel_cmd = min(0.5 * self.far_approach_linear_vel, chassis_max_linear_vel)
+                angular_vel_cmd = math.radians(angular_cmd_deg_s)
+            else:
+                linear_vel_cmd = 0.0
+                angular_vel_cmd = 0.0
+
+            return linear_vel_cmd, angular_vel_cmd, False, True
+
+        if self.search_scan_phase == "far_wait_cycle":
+            if now >= self.search_scan_far_cycle_wait_until:
+                self.search_scan_phase = "far"
+                self.search_scan_active = False
+                self.search_scan_completed_sweeps = 0
+                self.search_scan_exhausted = False
+                self.search_scan_far_detect_slowdown_until = 0.0
+                self.search_scan_far_detect_streak = 0
+                self.far_recover_forward_until = 0.0
+                print(f"[INFO] FAR cycle restart: running {self.search_scan_far_max_sweeps} sweeps")
+            return 0.0, 0.0, False, False
+
+        if self.search_scan_phase == "wait_far":
+            if now >= self.search_scan_far_wait_until:
+                if self.far_detector_ready:
+                    self.search_scan_phase = "far"
+                    self.search_scan_active = False
+                    self.search_scan_completed_sweeps = 0
+                    self.search_scan_exhausted = False
+                    self.search_scan_direction = 1.0
+                    self.search_scan_far_detect_slowdown_until = 0.0
+                    self.search_scan_far_detect_streak = 0
+                    self.far_recover_forward_until = 0.0
+                    print("[INFO] Starting FAR search phase: 2 sweeps with CSI0 NCNN detection")
+                else:
+                    self.search_scan_phase = "done"
+                    self.search_scan_exhausted = True
+                    print("[INFO] Far search skipped (CSI0 NCNN unavailable)")
+            return 0.0, 0.0, False, False
+
+        phase_name = "FAR" if self.search_scan_phase == "far" else "NORMAL"
+        phase_max_sweeps = self.search_scan_far_max_sweeps if self.search_scan_phase == "far" else self.search_scan_max_sweeps
+
+        if self.search_scan_phase == "far":
+            if far_ball_detected:
+                if now >= self.search_scan_far_detect_slowdown_until:
+                    print(
+                        f"[INFO] FAR detection seen: slowing sweep to "
+                        f"{self.search_scan_far_detect_slowdown_factor:.2f}x"
+                    )
+                self.search_scan_far_detect_slowdown_until = max(
+                    self.search_scan_far_detect_slowdown_until,
+                    now + self.search_scan_far_detect_slowdown_hold_s,
+                )
+
+                self.search_scan_far_detect_streak += 1
+                if self.search_scan_far_detect_streak >= self.search_scan_far_detect_confirm_frames:
+                    self.search_scan_active = False
+                    self.search_scan_exhausted = False
+                    self.search_scan_phase = "far_approach"
+                    self.search_scan_far_cycle_count = 0
+                    self.far_target_lock_active = True
+                    self.far_target_lock_px = far_ball_center_px
+                    self.far_target_lock_bearing_deg = far_ball_bearing_deg
+                    self.far_target_lock_conf = far_ball_best_conf
+                    self.far_target_lost_frames = 0
+                    print(
+                        f"[INFO] FAR target acquired: switching to FAR approach. "
+                        f"Direction={far_ball_direction_text}, bearing={far_ball_bearing_deg:+.1f}deg"
+                    )
+                    return 0.0, 0.0, False, True
+            else:
+                self.search_scan_far_detect_streak = 0
+
+        if self.search_scan_exhausted:
+            return 0.0, 0.0, False, False
+
+        if not self.search_scan_active:
+            self.search_scan_active = True
+            self.search_scan_start_time = now
+            current_speed = self._get_current_sweep_speed_deg_s(now=now)
+            print(
+                f"[INFO] {phase_name} search sweep start: angle={self.search_scan_angle_deg:.1f}deg, "
+                f"speed={current_speed:.1f}deg/s, "
+                f"direction={'CCW' if self.search_scan_direction > 0 else 'CW'}"
+            )
+
+        sweep_elapsed = now - self.search_scan_start_time
+        if sweep_elapsed >= self._get_current_sweep_duration_s(now=now):
+            self.search_scan_completed_sweeps += 1
+            if self.search_scan_completed_sweeps >= phase_max_sweeps:
+                self.search_scan_active = False
+                self.search_scan_exhausted = True
+                if self.search_scan_phase == "normal":
+                    self.search_scan_phase = "wait_far"
+                    self.search_scan_far_wait_until = now + self.search_scan_far_wait_s
+                    print(
+                        f"[INFO] Normal search stopped after {self.search_scan_completed_sweeps} sweeps; "
+                        f"waiting {self.search_scan_far_wait_s:.1f}s before FAR search"
+                    )
+                elif self.search_scan_phase == "far":
+                    self.search_scan_far_cycle_count += 1
+                    if self.search_scan_far_cycle_count >= self.search_scan_far_max_cycles:
+                        self.search_scan_phase = "done"
+                        self.search_scan_far_detect_slowdown_until = 0.0
+                        self.search_scan_far_detect_streak = 0
+                        self.far_recover_forward_until = 0.0
+                        print(
+                            f"[INFO] FAR search stopped after {self.search_scan_far_cycle_count} cycles with no detections"
+                        )
+                    else:
+                        self.search_scan_phase = "far_wait_cycle"
+                        self.search_scan_exhausted = False
+                        self.search_scan_far_cycle_wait_until = now + self.search_scan_far_cycle_wait_s
+                        self.search_scan_far_detect_slowdown_until = 0.0
+                        self.search_scan_far_detect_streak = 0
+                        self.far_recover_forward_until = 0.0
+                        print(
+                            f"[INFO] FAR cycle complete ({self.search_scan_completed_sweeps} sweeps); "
+                            f"waiting {self.search_scan_far_cycle_wait_s:.1f}s "
+                            f"(cycle {self.search_scan_far_cycle_count}/{self.search_scan_far_max_cycles})"
+                        )
+                else:
+                    self.search_scan_phase = "done"
+                    self.search_scan_far_detect_slowdown_until = 0.0
+                    self.search_scan_far_detect_streak = 0
+                    self.far_recover_forward_until = 0.0
+                    print(
+                        f"[INFO] Far search stopped: no ball detected after {self.search_scan_completed_sweeps} sweeps"
+                    )
+                return 0.0, 0.0, False, False
+
+            self.search_scan_direction *= -1.0
+            self.search_scan_start_time = now
+            print(
+                f"[INFO] {phase_name} search sweep reverse: direction={'CCW' if self.search_scan_direction > 0 else 'CW'} "
+                f"({self.search_scan_completed_sweeps}/{phase_max_sweeps})"
+            )
+
+        if not self.search_scan_exhausted:
+            current_speed = self._get_current_sweep_speed_deg_s(now=now)
+            return 0.0, math.radians(current_speed * self.search_scan_direction), False, True
+
+        return 0.0, 0.0, False, False
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Ball collection with visual servoing control"
@@ -913,37 +1267,11 @@ def main():
     user_inlet_enabled = True  # User's inlet preference
     manual_mode = False  # Manual keyboard control vs autonomous
 
-    # Optional search scan mode (toggle with 's')
-    search_scan_enabled = True
-    search_scan_angle_deg = max(1.0, float(args.search_scan_angle_deg))
-    search_scan_speed_deg_s = 40.0
-    search_scan_direction = 1.0
-    search_scan_active = False
-    search_scan_start_time = 0.0
-    search_scan_duration_s = search_scan_angle_deg / search_scan_speed_deg_s
-    search_scan_max_sweeps = 2
-    search_scan_far_max_sweeps = 2
-    search_scan_completed_sweeps = 0
-    search_scan_exhausted = False
-    search_scan_phase = "normal"  # normal -> wait_far -> far -> far_wait_cycle -> far ... or far_approach
-    search_scan_far_wait_s = 1.0
-    search_scan_far_wait_until = 0.0
-    search_scan_far_cycle_wait_s = 5.0
-    search_scan_far_cycle_wait_until = 0.0
-    far_target_last_bearing_deg = None
-    far_target_last_direction_text = ""
-    far_approach_linear_vel = 0.06
-    far_approach_kp_angular = 2.2  # deg/s per deg bearing error
-    far_approach_max_angular_deg_s = 35.0
-    far_approach_center_tolerance_deg = 4.0
-    far_approach_lost_spin_deg_s = 12.0
-    far_target_lock_active = False
-    far_target_lock_px = None
-    far_target_lock_bearing_deg = None
-    far_target_lock_conf = 0.0
-    far_target_lost_frames = 0
-    far_target_match_max_px = 80.0
-    far_target_max_lost_frames = 10
+    # Optional long-range search/approach controller
+    long_range_controller = LongRangeSearchApproachController(
+        search_scan_angle_deg=args.search_scan_angle_deg,
+        far_detector_ready=far_detector_ready,
+    )
     
     # Manual control state
     manual_linear_vel = 0.0
@@ -1058,8 +1386,7 @@ def main():
                     if (
                         far_detector_ready
                         and running
-                        and search_scan_enabled
-                        and search_scan_phase in ("far", "far_approach")
+                        and long_range_controller.search_scan_enabled
                         and frame_csi0_rgb is not None
                     ):
                         det = far_detector_model.predict(
@@ -1073,6 +1400,7 @@ def main():
 
                         far_candidates = []
                         if det.boxes is not None and len(det.boxes) > 0:
+                            fx_far_px = (FRAME_W * 0.5) / math.tan(math.radians(FAR_CSI0_HFOV_DEG * 0.5))
                             for i in range(len(det.boxes)):
                                 cls = int(det.boxes.cls[i].item())
                                 if cls != far_detector_target_cls:
@@ -1081,6 +1409,21 @@ def main():
                                 x0, y0, x1, y1 = [int(v) for v in det.boxes.xyxy[i].tolist()]
                                 center_x = int((x0 + x1) * 0.5)
                                 center_y = int((y0 + y1) * 0.5)
+
+                                box_w = max(1.0, float(x1 - x0))
+                                box_h = max(1.0, float(y1 - y0))
+                                size_px = max(box_w, box_h)
+
+                                x_offset_px = float(center_x) - (FRAME_W * 0.5)
+                                norm_offset = x_offset_px / max(1.0, FRAME_W * 0.5)
+                                norm_offset = max(-1.0, min(1.0, norm_offset))
+                                bearing_deg = norm_offset * (FAR_CSI0_HFOV_DEG * 0.5)
+                                bearing_rad = math.radians(bearing_deg)
+
+                                # Approximate forward distance from bbox size, then project on chassis x-axis.
+                                range_m = (fx_far_px * FAR_BALL_DIAMETER_M) / size_px
+                                x_proj_m = max(0.0, range_m * math.cos(bearing_rad))
+
                                 far_candidates.append({
                                     "conf": conf,
                                     "x0": x0,
@@ -1088,75 +1431,116 @@ def main():
                                     "x1": x1,
                                     "y1": y1,
                                     "center": (center_x, center_y),
+                                    "bearing_deg": bearing_deg,
+                                    "x_proj_m": x_proj_m,
                                 })
 
                         selected_candidate = None
                         if far_candidates:
                             if (
-                                search_scan_phase == "far_approach"
-                                and far_target_lock_active
-                                and far_target_lock_px is not None
+                                long_range_controller.search_scan_phase == "far_approach"
+                                and long_range_controller.far_target_lock_active
+                                and long_range_controller.far_target_lock_px is not None
                             ):
-                                best_match = None
-                                best_dist = float("inf")
-                                for cand in far_candidates:
-                                    cx, cy = cand["center"]
-                                    dx = float(cx - far_target_lock_px[0])
-                                    dy = float(cy - far_target_lock_px[1])
-                                    d = math.hypot(dx, dy)
-                                    if d < best_dist:
-                                        best_dist = d
-                                        best_match = cand
+                                now_sel = time.monotonic()
 
-                                if best_match is not None and best_dist <= far_target_match_max_px:
-                                    selected_candidate = best_match
-                                    far_target_lost_frames = 0
-                                else:
-                                    far_target_lost_frames += 1
-                                    if far_target_lost_frames > far_target_max_lost_frames:
-                                        print(
-                                            f"[INFO] FAR target lock lost after {far_target_lost_frames} frames; allowing reacquire"
+                                # Low-frequency retarget: periodically switch to newly closest ball.
+                                if now_sel >= long_range_controller.far_target_retarget_next_time:
+                                    new_closest = min(
+                                        far_candidates,
+                                        key=lambda c: (c["x_proj_m"], -c["conf"]),
+                                    )
+
+                                    # Hysteresis: if current lock is almost as close, keep it to avoid oscillation.
+                                    current_lock_candidate = None
+                                    best_lock_dist = float("inf")
+                                    for cand in far_candidates:
+                                        cx, cy = cand["center"]
+                                        dx = float(cx - long_range_controller.far_target_lock_px[0])
+                                        dy = float(cy - long_range_controller.far_target_lock_px[1])
+                                        d = math.hypot(dx, dy)
+                                        if d < best_lock_dist:
+                                            best_lock_dist = d
+                                            current_lock_candidate = cand
+
+                                    if (
+                                        current_lock_candidate is not None
+                                        and best_lock_dist <= long_range_controller.far_target_match_max_px
+                                    ):
+                                        delta_xproj = (
+                                            current_lock_candidate["x_proj_m"] - new_closest["x_proj_m"]
                                         )
-                                        far_target_lock_active = False
-                                        far_target_lock_px = None
-                                        far_target_lock_bearing_deg = None
-                                        far_target_lock_conf = 0.0
+                                        if delta_xproj <= long_range_controller.far_target_retarget_xproj_hysteresis_m:
+                                            selected_candidate = current_lock_candidate
+                                        else:
+                                            selected_candidate = new_closest
+                                    else:
+                                        selected_candidate = new_closest
+
+                                    long_range_controller.far_target_retarget_next_time = (
+                                        now_sel + long_range_controller.far_target_retarget_period_s
+                                    )
+                                    long_range_controller.far_target_lost_frames = 0
+                                else:
+                                    # Between retarget ticks, keep matching current lock for stability.
+                                    best_match = None
+                                    best_dist = float("inf")
+                                    for cand in far_candidates:
+                                        cx, cy = cand["center"]
+                                        dx = float(cx - long_range_controller.far_target_lock_px[0])
+                                        dy = float(cy - long_range_controller.far_target_lock_px[1])
+                                        d = math.hypot(dx, dy)
+                                        if d < best_dist:
+                                            best_dist = d
+                                            best_match = cand
+
+                                    if best_match is not None and best_dist <= long_range_controller.far_target_match_max_px:
+                                        selected_candidate = best_match
+                                        long_range_controller.far_target_lost_frames = 0
+                                    else:
+                                        long_range_controller.far_target_lost_frames += 1
+                                        if long_range_controller.far_target_lost_frames > long_range_controller.far_target_max_lost_frames:
+                                            print(
+                                                f"[INFO] FAR target lock lost after {long_range_controller.far_target_lost_frames} frames; allowing reacquire"
+                                            )
+                                            long_range_controller.clear_target_lock()
 
                             if selected_candidate is None and (
-                                search_scan_phase != "far_approach" or not far_target_lock_active
+                                long_range_controller.search_scan_phase != "far_approach" or not long_range_controller.far_target_lock_active
                             ):
-                                selected_candidate = max(far_candidates, key=lambda c: c["conf"])
-                                far_target_lost_frames = 0
+                                if long_range_controller.search_scan_phase == "far":
+                                    selected_candidate = min(
+                                        far_candidates,
+                                        key=lambda c: (c["x_proj_m"], -c["conf"]),
+                                    )
+                                else:
+                                    selected_candidate = max(far_candidates, key=lambda c: c["conf"])
+                                long_range_controller.far_target_lost_frames = 0
 
                         if selected_candidate is not None:
                             far_ball_detected = True
                             far_ball_best_conf = float(selected_candidate["conf"])
                             far_ball_center_px = selected_candidate["center"]
 
-                            center_x = far_ball_center_px[0]
-                            image_center_x = FRAME_W * 0.5
-                            x_offset_px = center_x - image_center_x
-                            norm_offset = x_offset_px / max(1.0, image_center_x)
-                            norm_offset = max(-1.0, min(1.0, norm_offset))
-                            far_ball_bearing_deg = norm_offset * (FAR_CSI0_HFOV_DEG * 0.5)
+                            far_ball_bearing_deg = float(selected_candidate["bearing_deg"])
                             if far_ball_bearing_deg < -3.0:
                                 far_ball_direction_text = "LEFT"
                             elif far_ball_bearing_deg > 3.0:
                                 far_ball_direction_text = "RIGHT"
                             else:
                                 far_ball_direction_text = "CENTER"
-                            far_target_last_bearing_deg = far_ball_bearing_deg
-                            far_target_last_direction_text = far_ball_direction_text
+                            long_range_controller.far_target_last_bearing_deg = far_ball_bearing_deg
+                            long_range_controller.far_target_last_direction_text = far_ball_direction_text
 
-                            if search_scan_phase == "far_approach":
-                                if not far_target_lock_active:
+                            if long_range_controller.search_scan_phase == "far_approach":
+                                if not long_range_controller.far_target_lock_active:
                                     print(
                                         f"[INFO] FAR target lock acquired at {far_ball_center_px}, conf={far_ball_best_conf:.2f}"
                                     )
-                                far_target_lock_active = True
-                                far_target_lock_px = far_ball_center_px
-                                far_target_lock_bearing_deg = far_ball_bearing_deg
-                                far_target_lock_conf = far_ball_best_conf
+                                long_range_controller.far_target_lock_active = True
+                                long_range_controller.far_target_lock_px = far_ball_center_px
+                                long_range_controller.far_target_lock_bearing_deg = far_ball_bearing_deg
+                                long_range_controller.far_target_lock_conf = far_ball_best_conf
 
                         for cand in far_candidates:
                             is_selected = (
@@ -1206,6 +1590,7 @@ def main():
                         csi0_preview_error_reported = True
                     picam2_csi0 = None
                     far_detector_ready = False
+                    long_range_controller.set_far_detector_ready(False)
 
             # Detect collection-like transition (ball was seen, then disappears)
             current_time = time.monotonic()
@@ -1277,184 +1662,20 @@ def main():
                 inlet_active = user_inlet_enabled and controller.ball_detected
                 execute_motion = True
             else:
-                # Autonomous mode: execute planned trajectory when running
-                if running and controller.ball_detected:
-                    if search_scan_phase in ("wait_far", "far", "far_approach") or search_scan_active:
-                        print("[INFO] Ball detected in inlet camera: switching to inlet tracking")
-                    far_target_lock_active = False
-                    far_target_lock_px = None
-                    far_target_lock_bearing_deg = None
-                    far_target_lock_conf = 0.0
-                    far_target_lost_frames = 0
-                    search_scan_active = False
-                    search_scan_completed_sweeps = 0
-                    search_scan_exhausted = False
-                    search_scan_phase = "normal"
-                    linear_vel_cmd = planned_linear_vel
-                    angular_vel_cmd = planned_angular_vel
-                    inlet_active = user_inlet_enabled and controller.ball_detected
-                    execute_motion = True
-                elif running and search_scan_enabled:
-                    # Search scan mode state machine:
-                    # normal sweep -> stop 1s -> far sweep with CSI0+NCNN -> far approach
-                    now = time.monotonic()
-                    if search_scan_phase == "done":
-                        search_scan_exhausted = True
-                        far_target_lock_active = False
-                        far_target_lock_px = None
-                        far_target_lock_bearing_deg = None
-                        far_target_lock_conf = 0.0
-                        far_target_lost_frames = 0
-                        linear_vel_cmd = 0.0
-                        angular_vel_cmd = 0.0
-                        inlet_active = False
-                        execute_motion = False
-                    elif search_scan_phase == "far_approach":
-                        # Drive toward far target using CSI0 bearing until inlet camera reacquires ball.
-                        bearing_for_control = far_ball_bearing_deg
-                        if bearing_for_control is None:
-                            bearing_for_control = far_target_last_bearing_deg
-
-                        if bearing_for_control is not None:
-                            angular_cmd_deg_s = FAR_APPROACH_TURN_SIGN * far_approach_kp_angular * bearing_for_control
-                            angular_cmd_deg_s = max(
-                                -far_approach_max_angular_deg_s,
-                                min(far_approach_max_angular_deg_s, angular_cmd_deg_s),
-                            )
-                            if abs(bearing_for_control) <= far_approach_center_tolerance_deg:
-                                linear_vel_cmd = min(far_approach_linear_vel, chassis.max_linear_vel)
-                            else:
-                                linear_vel_cmd = 0.0
-                            angular_vel_cmd = math.radians(angular_cmd_deg_s)
-                            execute_motion = True
-                        else:
-                            # Lost target: slowly spin in last known direction to reacquire.
-                            spin_sign = (1.0 if far_target_last_direction_text == "RIGHT" else -1.0) * FAR_APPROACH_TURN_SIGN
-                            linear_vel_cmd = 0.0
-                            angular_vel_cmd = math.radians(spin_sign * far_approach_lost_spin_deg_s)
-                            execute_motion = True
-
-                        inlet_active = False
-                    elif search_scan_phase == "far_wait_cycle":
-                        linear_vel_cmd = 0.0
-                        angular_vel_cmd = 0.0
-                        inlet_active = False
-                        execute_motion = False
-                        if now >= search_scan_far_cycle_wait_until:
-                            search_scan_phase = "far"
-                            search_scan_active = False
-                            search_scan_completed_sweeps = 0
-                            search_scan_exhausted = False
-                            print(
-                                f"[INFO] FAR cycle restart: running {search_scan_far_max_sweeps} sweeps"
-                            )
-                    elif search_scan_phase == "wait_far":
-                        linear_vel_cmd = 0.0
-                        angular_vel_cmd = 0.0
-                        inlet_active = False
-                        execute_motion = False
-                        if now >= search_scan_far_wait_until:
-                            if far_detector_ready:
-                                search_scan_phase = "far"
-                                search_scan_active = False
-                                search_scan_completed_sweeps = 0
-                                search_scan_exhausted = False
-                                search_scan_direction = 1.0
-                                print("[INFO] Starting FAR search phase: 2 sweeps with CSI0 NCNN detection")
-                            else:
-                                search_scan_phase = "done"
-                                search_scan_exhausted = True
-                                print("[INFO] Far search skipped (CSI0 NCNN unavailable)")
-                    else:
-                        phase_name = "FAR" if search_scan_phase == "far" else "NORMAL"
-                        phase_max_sweeps = (
-                            search_scan_far_max_sweeps if search_scan_phase == "far" else search_scan_max_sweeps
-                        )
-
-                        if search_scan_phase == "far" and far_ball_detected:
-                            search_scan_active = False
-                            search_scan_exhausted = False
-                            search_scan_phase = "far_approach"
-                            far_target_lock_active = True
-                            far_target_lock_px = far_ball_center_px
-                            far_target_lock_bearing_deg = far_ball_bearing_deg
-                            far_target_lock_conf = far_ball_best_conf
-                            far_target_lost_frames = 0
-                            linear_vel_cmd = 0.0
-                            angular_vel_cmd = 0.0
-                            inlet_active = False
-                            execute_motion = True
-                            print(
-                                f"[INFO] FAR target acquired: switching to FAR approach. "
-                                f"Direction={far_ball_direction_text}, bearing={far_ball_bearing_deg:+.1f}deg"
-                            )
-
-                        if search_scan_exhausted:
-                            linear_vel_cmd = 0.0
-                            angular_vel_cmd = 0.0
-                            inlet_active = False
-                            execute_motion = False
-                        else:
-                            if not search_scan_active:
-                                search_scan_active = True
-                                search_scan_start_time = now
-                                print(
-                                    f"[INFO] {phase_name} search sweep start: angle={search_scan_angle_deg:.1f}deg, "
-                                    f"direction={'CCW' if search_scan_direction > 0 else 'CW'}"
-                                )
-
-                            sweep_elapsed = now - search_scan_start_time
-                            if sweep_elapsed >= search_scan_duration_s:
-                                search_scan_completed_sweeps += 1
-                                if search_scan_completed_sweeps >= phase_max_sweeps:
-                                    search_scan_active = False
-                                    search_scan_exhausted = True
-                                    if search_scan_phase == "normal":
-                                        search_scan_phase = "wait_far"
-                                        search_scan_far_wait_until = now + search_scan_far_wait_s
-                                        print(
-                                            f"[INFO] Normal search stopped after {search_scan_completed_sweeps} sweeps; "
-                                            f"waiting {search_scan_far_wait_s:.1f}s before FAR search"
-                                        )
-                                    elif search_scan_phase == "far":
-                                        search_scan_phase = "far_wait_cycle"
-                                        search_scan_exhausted = False
-                                        search_scan_far_cycle_wait_until = now + search_scan_far_cycle_wait_s
-                                        print(
-                                            f"[INFO] FAR cycle complete ({search_scan_completed_sweeps} sweeps); "
-                                            f"waiting {search_scan_far_cycle_wait_s:.1f}s"
-                                        )
-                                    else:
-                                        search_scan_phase = "done"
-                                        print(
-                                            f"[INFO] Far search stopped: no ball detected after {search_scan_completed_sweeps} sweeps"
-                                        )
-                                    linear_vel_cmd = 0.0
-                                    angular_vel_cmd = 0.0
-                                    inlet_active = False
-                                    execute_motion = False
-                                else:
-                                    search_scan_direction *= -1.0
-                                    search_scan_start_time = now
-                                    print(
-                                        f"[INFO] {phase_name} search sweep reverse: direction={'CCW' if search_scan_direction > 0 else 'CW'} "
-                                        f"({search_scan_completed_sweeps}/{phase_max_sweeps})"
-                                    )
-
-                            if not search_scan_exhausted:
-                                linear_vel_cmd = 0.0
-                                angular_vel_cmd = math.radians(search_scan_speed_deg_s * search_scan_direction)
-                                inlet_active = False
-                                execute_motion = True
-                else:
-                    search_scan_active = False
-                    search_scan_completed_sweeps = 0
-                    search_scan_exhausted = False
-                    search_scan_phase = "normal"
-                    linear_vel_cmd = 0.0
-                    angular_vel_cmd = 0.0
-                    inlet_active = False
-                    execute_motion = False
+                # Autonomous mode: planned inlet tracking + long-range search/approach fallback
+                linear_vel_cmd, angular_vel_cmd, inlet_active, execute_motion = long_range_controller.compute_commands(
+                    running=running,
+                    ball_detected=controller.ball_detected,
+                    user_inlet_enabled=user_inlet_enabled,
+                    planned_linear_vel=planned_linear_vel,
+                    planned_angular_vel=planned_angular_vel,
+                    far_ball_detected=far_ball_detected,
+                    far_ball_center_px=far_ball_center_px,
+                    far_ball_bearing_deg=far_ball_bearing_deg,
+                    far_ball_best_conf=far_ball_best_conf,
+                    far_ball_direction_text=far_ball_direction_text,
+                    chassis_max_linear_vel=chassis.max_linear_vel,
+                )
 
             if execute_motion and not in_post_collect:
                 last_motion_linear_cmd = linear_vel_cmd
@@ -1482,11 +1703,11 @@ def main():
             cv2.putText(frame_bgr, mode_text, (FRAME_W - 180, 30),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, mode_color, 2)
 
-            scan_text = f"Search: {'ON' if search_scan_enabled else 'OFF'}"
-            scan_color = (0, 200, 255) if search_scan_enabled else (128, 128, 128)
+            scan_text = f"Search: {'ON' if long_range_controller.search_scan_enabled else 'OFF'}"
+            scan_color = (0, 200, 255) if long_range_controller.search_scan_enabled else (128, 128, 128)
             cv2.putText(frame_bgr, scan_text, (FRAME_W - 180, 120),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, scan_color, 2)
-            cv2.putText(frame_bgr, f"Phase: {search_scan_phase}", (FRAME_W - 180, 145),
+            cv2.putText(frame_bgr, f"Phase: {long_range_controller.search_scan_phase}", (FRAME_W - 180, 145),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 255), 1)
             
             # Display current planner type
@@ -1548,7 +1769,7 @@ def main():
                         (0, 255, 255),
                         2,
                     )
-                    if search_scan_phase in ("far", "far_approach"):
+                    if long_range_controller.search_scan_phase in ("far", "far_approach"):
                         far_status = "FAR DETECT: ON" if far_detector_ready else "FAR DETECT: OFF"
                         cv2.putText(
                             frame_csi0_bgr,
@@ -1559,7 +1780,7 @@ def main():
                             (0, 255, 0) if far_detector_ready else (0, 0, 255),
                             2,
                         )
-                        phase_label = "FAR SWEEP" if search_scan_phase == "far" else "FAR APPROACH"
+                        phase_label = "FAR SWEEP" if long_range_controller.search_scan_phase == "far" else "FAR APPROACH"
                         cv2.putText(
                             frame_csi0_bgr,
                             phase_label,
@@ -1589,20 +1810,20 @@ def main():
                                     (0, 255, 255),
                                     2,
                                 )
-                        elif search_scan_phase == "far_approach" and far_target_last_bearing_deg is not None:
+                        elif long_range_controller.search_scan_phase == "far_approach" and long_range_controller.far_target_last_bearing_deg is not None:
                             cv2.putText(
                                 frame_csi0_bgr,
-                                f"DIR: {far_target_last_direction_text} ({far_target_last_bearing_deg:+.1f} deg)",
+                                f"DIR: {long_range_controller.far_target_last_direction_text} ({long_range_controller.far_target_last_bearing_deg:+.1f} deg)",
                                 (10, 125),
                                 cv2.FONT_HERSHEY_SIMPLEX,
                                 0.6,
                                 (0, 255, 255),
                                 2,
                             )
-                    elif search_scan_phase == "done" and far_target_last_bearing_deg is not None:
+                    elif long_range_controller.search_scan_phase == "done" and long_range_controller.far_target_last_bearing_deg is not None:
                         cv2.putText(
                             frame_csi0_bgr,
-                            f"LAST FAR TARGET: {far_target_last_direction_text} ({far_target_last_bearing_deg:+.1f} deg)",
+                            f"LAST FAR TARGET: {long_range_controller.far_target_last_direction_text} ({long_range_controller.far_target_last_bearing_deg:+.1f} deg)",
                             (10, 50),
                             cv2.FONT_HERSHEY_SIMPLEX,
                             0.65,
@@ -1638,16 +1859,7 @@ def main():
                 break
             elif key_char == ord(' '):
                 running = not running
-                if not running:
-                    search_scan_active = False
-                    far_target_lock_active = False
-                    far_target_lock_px = None
-                    far_target_lock_bearing_deg = None
-                    far_target_lock_conf = 0.0
-                    far_target_lost_frames = 0
-                search_scan_completed_sweeps = 0
-                search_scan_exhausted = False
-                search_scan_phase = "normal"
+                long_range_controller.on_autonomy_toggled(running)
                 print(f"Autonomous planning: {'RUNNING' if running else 'STOPPED'}")
             elif key_char == ord('m'):
                 manual_mode = not manual_mode
@@ -1668,19 +1880,10 @@ def main():
                 user_inlet_enabled = not user_inlet_enabled
                 print(f"Inlet: {'ON' if user_inlet_enabled else 'OFF'}")
             elif key_char == ord('s'):
-                search_scan_enabled = not search_scan_enabled
-                search_scan_active = False
-                far_target_lock_active = False
-                far_target_lock_px = None
-                far_target_lock_bearing_deg = None
-                far_target_lock_conf = 0.0
-                far_target_lost_frames = 0
-                search_scan_completed_sweeps = 0
-                search_scan_exhausted = False
-                search_scan_phase = "normal"
+                search_scan_enabled = long_range_controller.toggle_search_scan()
                 print(
                     f"Search scan mode: {'ON' if search_scan_enabled else 'OFF'} "
-                    f"(sweep angle={search_scan_angle_deg:.1f}deg)"
+                    f"(sweep angle={long_range_controller.search_scan_angle_deg:.1f}deg)"
                 )
             elif key_char == ord('1'):
                 controller.set_trajectory_planner(TRAJECTORY_PLANNER_BEZIER)
