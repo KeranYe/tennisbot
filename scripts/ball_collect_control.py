@@ -758,7 +758,7 @@ class LongRangeSearchApproachController:
         self.far_detector_ready = bool(far_detector_ready)
         self.far_target_last_bearing_deg = None
         self.far_target_last_direction_text = ""
-        self.far_approach_linear_vel = 0.06
+        self.far_approach_linear_vel = 0.25
         self.far_approach_kp_angular = 2.2  # deg/s per deg bearing error
         self.far_approach_max_angular_deg_s = 35.0
         self.far_approach_center_tolerance_deg = 4.0
@@ -932,7 +932,7 @@ class LongRangeSearchApproachController:
                     linear_vel_cmd = min(self.far_approach_linear_vel, chassis_max_linear_vel)
                 else:
                     # Keep approaching (reduced speed) instead of spin-in-place.
-                    linear_vel_cmd = min(0.5 * self.far_approach_linear_vel, chassis_max_linear_vel)
+                    linear_vel_cmd = min(0.7 * self.far_approach_linear_vel, chassis_max_linear_vel)
                 angular_vel_cmd = math.radians(angular_cmd_deg_s)
             else:
                 linear_vel_cmd = 0.0
@@ -1113,13 +1113,13 @@ def main():
     # Initialize chassis
     chassis = Chassis(
         packetHandler,
-        shaft_distance=0.2,
-        wheel_diameter=0.1,
-        inlet_disk_diameter=0.05,
+        shaft_distance=0.314, # 0.2
+        wheel_diameter=0.2, # 0.1
+        inlet_disk_diameter=0.09, # 0.05
         wheel_reduction=1,
         inlet_reduction=0.1,
-        max_linear_vel=0.225,  # 1.5x faster for visual servoing
-        max_angular_vel_deg=60,  # 1.5x faster angular velocity
+        max_linear_vel=0.225,
+        max_angular_vel_deg=90,  # 60
         max_inlet_vel=4.5
     )
     
