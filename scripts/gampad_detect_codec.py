@@ -4,6 +4,7 @@ import sys
 import time
 from typing import Optional, Sequence
 from evdev import InputDevice, ecodes
+import glob
 
 # try:
 #     from evdev import InputDevice, ecodes
@@ -143,17 +144,19 @@ def find_matching_device(device_name: str, candidates: Sequence[str]) -> Optiona
 def main() -> int:
     device_name = "8Bitdo SF30 Pro"  # 8Bitdo SF30 Pro, Logitech Gamepad F710
 
-    candidates = [
-        "/dev/input/event0",
-        "/dev/input/event1",
-        "/dev/input/event2",
-        "/dev/input/event3",
-        "/dev/input/event4",
-        "/dev/input/event28",
-        "/dev/input/event29",
-        "/dev/input/js0",
-        "/dev/input/js1",
-    ]
+    # candidates = [
+    #     "/dev/input/event0",
+    #     "/dev/input/event1",
+    #     "/dev/input/event2",
+    #     "/dev/input/event3",
+    #     "/dev/input/event4",
+    #     "/dev/input/event28",
+    #     "/dev/input/event29",
+    #     "/dev/input/js0",
+    #     "/dev/input/js1",
+    # ]
+
+    candidates = sorted(glob.glob("/dev/input/event*"))
 
     dev = find_matching_device(device_name, candidates)
     if dev is None:
