@@ -1917,6 +1917,9 @@ def main():
                 running = not running
                 long_range_controller.on_autonomy_toggled(running)
                 print(f"Autonomous planning: {'RUNNING' if running else 'STOPPED'}")
+                if running:
+                    chassis.startShake(duration=shake_duration_s)
+                    print(f"[INFO] Auto-mode started: shaking for {shake_duration_s:.1f}s")
             elif key_char == ord('m'):
                 manual_mode = not manual_mode
                 if manual_mode:
