@@ -63,6 +63,11 @@ TRAJECTORY_PLANNER_SHAPED = "shaped"  # Close-range approach shaping
 TRAJECTORY_PLANNER_DIRECT = "direct"  # Simple direct line to ball
 TRAJECTORY_PLANNER_ARC = "arc"  # Smooth arc trajectory
 
+# Bézier control point types (only used with TRAJECTORY_PLANNER_BEZIER)
+BEZIER_CP_BALL_CENTER = "ball_center"   # X-axis projection of ball center (default)
+BEZIER_CP_MIDPOINT = "midpoint"         # X-axis projection of midpoint between inlet and ball
+BEZIER_CP_BALL_MIRROR = "ball_mirror"   # X-axis mirror of ball center (ball_x, -ball_y)
+
 
 class InletVisualController:
     """
@@ -105,6 +110,7 @@ class InletVisualController:
         
         self.control_period = 1.0 / self.control_rate_hz
         self.trajectory_planner = trajectory_planner
+        self.bezier_control_point = BEZIER_CP_BALL_CENTER  # Default: x-axis projection of ball center
         self.ball_detected = False
         self.ball_pos_ballfinder = None  # Ball position from BallFinder frame
         self.ball_pos_chassis = None  # Ball position in chassis frame
@@ -170,7 +176,9 @@ class InletVisualController:
     def _plan_trajectory_bezier(self, ball_pos_chassis):
         """
         Quadratic Bézier curve trajectory from inlet to ball.
-        Control point is the projection of the midpoint onto the chassis x-axis.
+        The middle control point is selected by self.bezier_control_point:
+          BEZIER_CP_BALL_CENTER: x-axis projection of ball center (default)
+          BEZIER_CP_MIDPOINT:    x-axis projection of midpoint between inlet and ball
         
         Args:
             ball_pos_chassis: Ball position in chassis frame [x, y, z]
@@ -194,12 +202,22 @@ class InletVisualController:
         P0 = np.array([inlet_x, inlet_y])  # Start: inlet
         P2 = np.array([ball_x, ball_y])    # End: ball
         
-        # Middle control point: project midpoint onto chassis x-axis (y=0)
-        midpoint_x = (inlet_x + ball_x) / 2.0
-        midpoint_y = (inlet_y + ball_y) / 2.0
-        P1 = np.array([midpoint_x, 0.0])  # Project onto x-axis
+        # Middle control point: project chosen reference onto chassis x-axis (y=0)
+        if self.bezier_control_point == BEZIER_CP_MIDPOINT:
+            cp_x = (inlet_x + ball_x) / 2.0  # midpoint x
+            cp_y = 0.0
+            cp_type_label = "midpoint"
+        elif self.bezier_control_point == BEZIER_CP_BALL_MIRROR:
+            cp_x = ball_x                     # ball center x
+            cp_y = -ball_y                    # mirror ball_y across x-axis
+            cp_type_label = "ball_mirror"
+        else:  # BEZIER_CP_BALL_CENTER (default)
+            cp_x = ball_x                     # ball center x
+            cp_y = 0.0
+            cp_type_label = "ball_center"
+        P1 = np.array([cp_x, cp_y])
         
-        print(f"[DEBUG] Bézier control points: P0={fmt_cm([P0[0], P0[1], 0])}, "
+        print(f"[DEBUG] Bézier control points ({cp_type_label}): P0={fmt_cm([P0[0], P0[1], 0])}, "
               f"P1={fmt_cm([P1[0], P1[1], 0])}, P2={fmt_cm([P2[0], P2[1], 0])}")
         
         # Generate waypoints
@@ -1250,6 +1268,7 @@ def main():
     print("    2: Shaped approach")
     print("    3: Direct line")
     print("    4: Arc")
+    print("  5 = cycle Bézier control point type (ball_center / midpoint / ball_mirror)")
     print("Manual keyboard control (when in manual mode):")
     print("  UP/DOWN arrows = linear velocity +/- 0.01 m/s")
     print("  LEFT/RIGHT arrows = angular velocity +/- 1 deg/s")
@@ -1282,12 +1301,16 @@ def main():
     # Post-collection behavior: keep all motors on briefly after ball disappears
     post_collect_duration_s = 1.0
     post_collect_until = 0.0
+    post_collect_inlet_extra_s = 1.0  # Extra time inlet stays on after shake ends
+    post_collect_inlet_until = 0.0
     post_collect_cooldown_s = 3.0  # Cooldown period to prevent repeated triggering
     post_collect_cooldown_until = 0.0
+    shake_duration_s = 5.0          # Duration of post-collection shake (seconds)
     prev_ball_detected = False
     ball_detected_since = 0.0  # Timestamp when ball first detected
     min_detection_duration_s = 1.5  # Minimum time ball must be detected to be considered real
     collect_near_inlet_distance_m = 0.07  # Count as collected if ball center gets this close to inlet
+    inlet_activate_distance_m = 0.12  # Activate inlet only when ball is within this distance of inlet (meters)
     episode_min_ball_inlet_distance_m = float('inf')
     last_motion_linear_cmd = 0.0
     last_motion_angular_cmd = 0.0
@@ -1626,11 +1649,14 @@ def main():
                         last_motion_linear_cmd = min(0.03, chassis.max_linear_vel)
                         last_motion_angular_cmd = 0.0
                     post_collect_until = current_time + post_collect_duration_s
+                    post_collect_inlet_until = current_time + shake_duration_s + post_collect_inlet_extra_s
                     post_collect_cooldown_until = current_time + post_collect_cooldown_s
+                    chassis.startShake(duration=shake_duration_s)
                     print(
                         f"[INFO] Ball collected #{balls_collected_count} "
                         f"(detected for {detection_duration:.2f}s, min inlet dist={episode_min_ball_inlet_distance_m*100:.1f}cm): "
-                        f"keeping motors on for {post_collect_duration_s:.1f}s"
+                        f"keeping motors on for {post_collect_duration_s:.1f}s, shaking for {shake_duration_s:.1f}s, "
+                        f"inlet on for {shake_duration_s + post_collect_inlet_extra_s:.1f}s total"
                     )
                 elif not ball_was_real:
                     print(
@@ -1641,6 +1667,16 @@ def main():
             
             prev_ball_detected = controller.ball_detected
             
+            # Compute ball-to-inlet distance for proximity-based inlet control
+            ball_near_inlet = False
+            if controller.ball_detected and controller.ball_pos_chassis is not None:
+                _inlet_pos = controller.T_chassis_to_inlet[:3, 3]
+                _ball_inlet_dist = math.hypot(
+                    controller.ball_pos_chassis[0] - _inlet_pos[0],
+                    controller.ball_pos_chassis[1] - _inlet_pos[1],
+                )
+                ball_near_inlet = _ball_inlet_dist <= inlet_activate_distance_m
+
             # Compute control commands
             planned_linear_vel = 0.0
             planned_angular_vel = 0.0
@@ -1649,8 +1685,16 @@ def main():
                 planned_linear_vel, planned_angular_vel = controller.compute_control()
             
             # Determine actual commands to execute
-            in_post_collect = time.monotonic() < post_collect_until
-            if in_post_collect:
+            in_post_collect = current_time < post_collect_until
+            with chassis.state_lock:
+                in_shake = chassis.shake_active
+                shake_remaining = max(0.0, chassis.shake_start_time + chassis.shake_duration - current_time) if in_shake else 0.0
+            if in_shake:
+                linear_vel_cmd = 0.0
+                angular_vel_cmd = 0.0
+                inlet_active = False
+                execute_motion = True
+            elif in_post_collect:
                 linear_vel_cmd = last_motion_linear_cmd
                 angular_vel_cmd = last_motion_angular_cmd
                 inlet_active = True
@@ -1659,7 +1703,7 @@ def main():
                 # Manual mode: use keyboard commands
                 linear_vel_cmd = manual_linear_vel
                 angular_vel_cmd = math.radians(manual_angular_vel)
-                inlet_active = user_inlet_enabled and controller.ball_detected
+                inlet_active = user_inlet_enabled and ball_near_inlet
                 execute_motion = True
             else:
                 # Autonomous mode: planned inlet tracking + long-range search/approach fallback
@@ -1676,8 +1720,14 @@ def main():
                     far_ball_direction_text=far_ball_direction_text,
                     chassis_max_linear_vel=chassis.max_linear_vel,
                 )
+                # Gate autonomous inlet by proximity
+                inlet_active = inlet_active and ball_near_inlet
 
-            if execute_motion and not in_post_collect:
+            # Keep inlet on for extended period after collection (even after shake ends)
+            if not in_shake and current_time < post_collect_inlet_until:
+                inlet_active = True
+
+            if execute_motion and not in_post_collect and not in_shake:
                 last_motion_linear_cmd = linear_vel_cmd
                 last_motion_angular_cmd = angular_vel_cmd
             
@@ -1710,10 +1760,13 @@ def main():
             cv2.putText(frame_bgr, f"Phase: {long_range_controller.search_scan_phase}", (FRAME_W - 180, 145),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 255), 1)
             
-            # Display current planner type
-            planner_display = f"Planner: {controller.trajectory_planner.upper()}"
+            # Display current planner type (and Bézier CP type when relevant)
+            if controller.trajectory_planner == TRAJECTORY_PLANNER_BEZIER:
+                planner_display = f"Planner: BEZIER/{controller.bezier_control_point.upper()}"
+            else:
+                planner_display = f"Planner: {controller.trajectory_planner.upper()}"
             cv2.putText(frame_bgr, planner_display, (FRAME_W - 180, 60),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 180, 100), 2)
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 180, 100), 2)
 
             # Display collected ball count (session)
             count_display = f"Collected: {balls_collected_count}"
@@ -1735,6 +1788,9 @@ def main():
             if manual_mode:
                 cmd_label = "Executing (manual):"
                 cmd_color = (0, 255, 255)
+            elif in_shake:
+                cmd_label = f"Executing (SHAKE {shake_remaining:.1f}s):"
+                cmd_color = (0, 255, 128)
             elif in_post_collect:
                 cmd_label = "Executing (collect+1s):"
                 cmd_color = (0, 200, 255)
@@ -1893,6 +1949,13 @@ def main():
                 controller.set_trajectory_planner(TRAJECTORY_PLANNER_DIRECT)
             elif key_char == ord('4'):
                 controller.set_trajectory_planner(TRAJECTORY_PLANNER_ARC)
+            elif key_char == ord('5'):
+                _cp_cycle = [BEZIER_CP_BALL_CENTER, BEZIER_CP_MIDPOINT, BEZIER_CP_BALL_MIRROR]
+                _cp_idx = _cp_cycle.index(controller.bezier_control_point) if controller.bezier_control_point in _cp_cycle else 0
+                controller.bezier_control_point = _cp_cycle[(_cp_idx + 1) % len(_cp_cycle)]
+                controller.trajectory = []  # Force replan
+                controller.current_traj_step = 0
+                print(f"[INFO] Bézier control point: {controller.bezier_control_point}")
             elif key_char == ord('r'):
                 balls_collected_count = 0
                 print("Ball counter reset to 0")

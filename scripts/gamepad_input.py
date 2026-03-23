@@ -4,6 +4,7 @@ import time
 import math
 from typing import Optional
 from evdev import InputDevice, ecodes
+import glob
 
 
 class GamepadInputController:
@@ -15,6 +16,7 @@ class GamepadInputController:
     SN30PRO_BTN_B = 304
     SN30PRO_BTN_X = 307
     SN30PRO_BTN_Y = 306
+    SN30PRO_BTN_R = 309
     SN30PRO_AXIS_LEFT_X = 0
     SN30PRO_AXIS_LEFT_Y = 1
     SN30PRO_AXIS_RIGHT_X = 3
@@ -28,6 +30,7 @@ class GamepadInputController:
     F710_BTN_B = ecodes.BTN_B
     F710_BTN_X = ecodes.BTN_X
     F710_BTN_Y = ecodes.BTN_Y
+    F710_BTN_R = ecodes.BTN_TR
     F710_AXIS_LEFT_X = ecodes.ABS_HAT0X
     F710_AXIS_LEFT_Y = ecodes.ABS_HAT0Y
     F710_AXIS_RIGHT_X = ecodes.ABS_RX
@@ -45,6 +48,7 @@ class GamepadInputController:
         self.btn_stop = None
         self.btn_inlet_toggle = None
         self.btn_quit = None
+        self.btn_shake = None
         
         # Axis mappings
         self.axis_linear = None
@@ -59,15 +63,7 @@ class GamepadInputController:
 
     def _find_gamepad(self) -> Optional[InputDevice]:
         """Find and connect to a supported gamepad."""
-        candidates = [
-            "/dev/input/event0",
-            "/dev/input/event1",
-            "/dev/input/event2",
-            "/dev/input/event3",
-            "/dev/input/event4",
-            "/dev/input/event28",
-            "/dev/input/event29",
-        ]
+        candidates = sorted(glob.glob("/dev/input/event*"))
         
         # Try to find 8BitDo SN30 Pro
         for path in candidates:
@@ -109,6 +105,7 @@ class GamepadInputController:
         self.btn_stop = self.SN30PRO_BTN_Y
         self.btn_inlet_toggle = self.SN30PRO_BTN_A
         self.btn_quit = self.SN30PRO_BTN_B
+        self.btn_shake = self.SN30PRO_BTN_R
         
         self.axis_linear = self.SN30PRO_AXIS_RIGHT_Y
         self.axis_angular = self.SN30PRO_AXIS_LEFT_X
@@ -121,6 +118,7 @@ class GamepadInputController:
         self.btn_stop = self.F710_BTN_Y
         self.btn_inlet_toggle = self.F710_BTN_A
         self.btn_quit = self.F710_BTN_B
+        self.btn_shake = self.F710_BTN_R
         
         self.axis_linear = self.F710_AXIS_RIGHT_Y
         self.axis_angular = self.F710_AXIS_LEFT_X
@@ -177,6 +175,7 @@ class GamepadInputController:
                     self.chassis.linear_vel_cmd = 0.0
                     self.chassis.angular_vel_cmd = 0.0
                     self.chassis.inlet_enabled = False
+                    self.chassis.shake_active = False
                 
             elif code == self.btn_inlet_toggle:
                 with self.chassis.state_lock:
@@ -187,6 +186,10 @@ class GamepadInputController:
             elif code == self.btn_quit:
                 print("Button B pressed: QUIT")
                 return True  # Signal to quit
+
+            elif code == self.btn_shake:
+                print("Button R pressed: SHAKE")
+                self.chassis.startShake(duration=5.0)
         
         return False
 
@@ -239,6 +242,7 @@ class GamepadInputController:
         print("  Button Y           : STOP (disable RUN)")
         print("  Button A           : Toggle inlet wheel")
         print("  Button B           : QUIT")
+        print("  Button R1          : SHAKE (oscillate in place for 5s)")
         print("\nGamepad connected. Ready for input...\n")
         
         try:

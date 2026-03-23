@@ -182,6 +182,9 @@ class Chassis:
         self.state_lock = threading.Lock()
         self.inlet_enabled = False
         self.inlet_vel_cmd = self.max_inlet_vel
+        self.shake_active = False
+        self.shake_start_time = 0.0
+        self.shake_duration = 5.0
         self.keyboard_controller = KeyboardInputController(self)
         self.gamepad_controller = GamepadInputController(self)
 
@@ -219,9 +222,18 @@ class Chassis:
             self.linear_vel_cmd = 0.0
             self.angular_vel_cmd = 0.0
             self.inlet_enabled = False
+            self.shake_active = False
         self.left_wheel.stop()
         self.right_wheel.stop()
         self.inlet_wheel.stop()
+
+    def startShake(self, duration=5.0):
+        """Activate shake maneuver: oscillate in place for `duration` seconds."""
+        with self.state_lock:
+            self.shake_active = True
+            self.shake_start_time = time.monotonic()
+            self.shake_duration = duration
+        print(f"Shake started (duration: {duration}s)")
     
     def setInletWheelCommand(self, ang_vel_cmd, ang_acc_cmd):
         self.inlet_wheel.setCommands(ang_vel_cmd, ang_acc_cmd)
@@ -243,10 +255,27 @@ class Chassis:
                 angular_vel_cmd = self.angular_vel_cmd
                 inlet_enabled = self.inlet_enabled
                 inlet_vel_cmd = self._clamp(self.inlet_vel_cmd, 0.0, self.max_inlet_vel)
+                shake_active = self.shake_active
+                shake_start_time = self.shake_start_time
+                shake_duration = self.shake_duration
             run_enabled = self.run_event.is_set()
 
             if run_enabled:
-                self.setMotionCommands(linear_vel_cmd, angular_vel_cmd)
+                if shake_active:
+                    shake_elapsed = loop_start - shake_start_time
+                    if shake_elapsed < shake_duration:
+                        max_angular_vel_rad = math.radians(self.max_angular_vel_deg)
+                        shake_angular_vel = 1.0 * max_angular_vel_rad * math.sin(2 * math.pi * 1.0 * shake_elapsed)
+                        self.setMotionCommands(0.0, shake_angular_vel)
+                    else:
+                        with self.state_lock:
+                            self.shake_active = False
+                            self.linear_vel_cmd = 0.0
+                            self.angular_vel_cmd = 0.0
+                        self.setMotionCommands(0.0, 0.0)
+                        print("Shake complete")
+                else:
+                    self.setMotionCommands(linear_vel_cmd, angular_vel_cmd)
             else:
                 self.setMotionCommands(0.0, 0.0)
 
@@ -327,9 +356,14 @@ def main():
         return
 
     chassis = Chassis(packetHandler, 
-                    shaft_distance=0.2, wheel_diameter=0.1, inlet_disk_diameter=0.05, 
-                    wheel_reduction=1, inlet_reduction=0.1, 
-                    max_linear_vel=0.2, max_angular_vel_deg=45, max_inlet_vel=3.0
+                    shaft_distance=0.314, 
+                    wheel_diameter=0.2, 
+                    inlet_disk_diameter=0.09, 
+                    wheel_reduction=1, 
+                    inlet_reduction=0.1, 
+                    max_linear_vel=0.25, 
+                    max_angular_vel_deg=90, 
+                    max_inlet_vel=4.5
                     )
 
     # chassis.startKeyboardControl()
