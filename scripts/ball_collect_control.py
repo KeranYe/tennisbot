@@ -122,7 +122,7 @@ class InletVisualController:
         self.last_trajectory_update = 0.0
         
         # Control gains
-        self.k_linear = 0.5    # Proportional gain for linear velocity
+        self.k_linear = 3.0    # Proportional gain for linear velocity
         self.k_angular = 2.0   # Proportional gain for angular velocity
         self.min_linear_vel = 0.05  # Minimum linear velocity (m/s) to avoid slow approach
         self.min_angular_vel = math.radians(5.0)  # Minimum angular velocity (rad/s) to avoid slow turning
@@ -1136,8 +1136,8 @@ def main():
         inlet_disk_diameter=0.09, # 0.05
         wheel_reduction=1,
         inlet_reduction=0.1,
-        max_linear_vel=0.225,
-        max_angular_vel_deg=90,  # 60
+        max_linear_vel=0.35,
+        max_angular_vel_deg=120,  # 60
         max_inlet_vel=4.5
     )
     
@@ -1299,23 +1299,49 @@ def main():
     key_angular_step = 1.0  # deg/s increment per keypress (matching keyboad_input.py)
 
     # Post-collection behavior: keep all motors on briefly after ball disappears
-    post_collect_duration_s = 1.0
+    post_collect_duration_s = 2.0
     post_collect_until = 0.0
     post_collect_inlet_extra_s = 1.0  # Extra time inlet stays on after shake ends
     post_collect_inlet_until = 0.0
     post_collect_cooldown_s = 3.0  # Cooldown period to prevent repeated triggering
     post_collect_cooldown_until = 0.0
-    shake_duration_s = 5.0          # Duration of post-collection shake (seconds)
+    shake_duration_s = 2.0          # Duration of post-collection shake (seconds)
     prev_ball_detected = False
     ball_detected_since = 0.0  # Timestamp when ball first detected
     min_detection_duration_s = 1.5  # Minimum time ball must be detected to be considered real
     collect_near_inlet_distance_m = 0.07  # Count as collected if ball center gets this close to inlet
-    inlet_activate_distance_m = 0.12  # Activate inlet only when ball is within this distance of inlet (meters)
+    inlet_activate_distance_m = 0.15  # Activate inlet only when ball is within this distance of inlet (meters)
+    recenter_x_proximity_m = 0.08   # Max |ball_x - inlet_x| to trigger Y-bias recentering (m)
+    recenter_y_bias_m = 0.02        # Min |ball_y| (lateral offset from centerline) to trigger recentering (m)
+    recenter_linear_vel_ms = 0.20   # Back-up speed during recentering correction (m/s)
+    recenter_angular_gain = 12.0     # Angular gain for recentering: rad/s per meter of Y offset
+    periodic_shake_every_n_balls = 1   # Trigger a longer settle-shake every N balls (0 = disabled)
+    periodic_shake_duration_s = 2.0    # Duration of the periodic settle-shake (longer than per-ball shake)
     episode_min_ball_inlet_distance_m = float('inf')
     last_motion_linear_cmd = 0.0
     last_motion_angular_cmd = 0.0
     balls_collected_count = 0
-    
+    # Target lock: once a ball is being tracked, prefer the nearest candidate
+    # to avoid switching between multiple balls on each frame.
+    locked_ball_px = None         # (u, v) pixel position of the currently locked ball
+    locked_ball_lost_frames = 0   # Consecutive frames the lock candidate was not found
+    locked_ball_max_lost = 5      # Clear lock after this many consecutive misses
+    locked_ball_max_jump_px = 80  # Max pixel distance to still match against the lock
+    locked_ball_min_inlet_dist_m = float('inf')  # Min inlet dist seen while current lock was active
+    collect_near_inlet_min_frames =18  # Ball must stay within collect_near_inlet_distance_m for this many frames
+    _near_inlet_frames = 0             # Consecutive frames ball has been within collection distance
+    # Jam-clear maneuver: back up + stir when multiple balls cluster near the inlet
+    jam_clear_trigger_balls = 4        # Number of balls closer than jam_clear_distance_m to trigger
+    jam_clear_distance_m = 0.20        # Balls within this distance of the inlet count toward jam trigger
+    jam_clear_max_cluster_radius_m = 0.10  # Max cluster radius (m) to count as jammed; larger = spread out = no jam
+    jam_clear_backup_vel = 0.0              # No backup during spin (pure rotation)
+    jam_clear_spin_vel_deg_s = 84.0        # Spin speed in deg/s for jam-clear 360° rotation (70% of max 120)
+    jam_clear_duration_s = 4.29            # Time for one full 360° turn (360 / spin_vel_deg_s)
+    jam_clear_cooldown_s = 4.0         # Minimum gap between consecutive jam-clear maneuvers
+    jam_clear_until = 0.0              # Timestamp when current jam-clear ends
+    jam_clear_cooldown_until = 0.0     # Earliest time the next jam-clear may start
+    jam_clear_start_time = 0.0         # Monotonic time when current jam-clear began
+
     try:
         while True:
             loop_start = time.monotonic()
@@ -1372,8 +1398,36 @@ def main():
             ball_pos_camera = None
             
             if dets:
-                chosen = max(dets, key=lambda t: t[0])
+                # --- Target-lock selection ---
+                # If we already have a locked target, prefer the detection whose
+                # pixel centre is closest to the lock, provided it is within
+                # locked_ball_max_jump_px.  Fall back to score-based selection when
+                # no lock exists or no candidate is close enough.
+                if locked_ball_px is not None:
+                    best_locked = min(
+                        dets,
+                        key=lambda t: math.hypot(t[7] - locked_ball_px[0],
+                                                  t[8] - locked_ball_px[1]),
+                    )
+                    dist_to_lock = math.hypot(
+                        best_locked[7] - locked_ball_px[0],
+                        best_locked[8] - locked_ball_px[1],
+                    )
+                    if dist_to_lock <= locked_ball_max_jump_px:
+                        chosen = best_locked
+                        locked_ball_lost_frames = 0
+                    else:
+                        # Lock drifted too far – re-acquire with best score
+                        chosen = max(dets, key=lambda t: t[0])
+                        locked_ball_lost_frames = 0
+                        locked_ball_min_inlet_dist_m = float('inf')  # new target
+                else:
+                    chosen = max(dets, key=lambda t: t[0])
+                    locked_ball_lost_frames = 0
+                    locked_ball_min_inlet_dist_m = float('inf')  # new lock established
+
                 score_total, conf, label, x, y, w, h, u, v = chosen
+                locked_ball_px = (u, v)  # update lock to latest position
                 ball_pixel_pos = (u, v)
                 
                 # Get 3D position
@@ -1387,6 +1441,35 @@ def main():
                 with chassis.state_lock:
                     chassis.inlet_enabled = user_inlet_enabled  # Use user preference
             else:
+                locked_ball_lost_frames += 1
+                if locked_ball_lost_frames >= locked_ball_max_lost:
+                    # Tracked ball has been missing for long enough — check if it was
+                    # collected (last seen close to inlet). This fires even when other
+                    # balls are still visible, which is the primary multi-ball path.
+                    _lock_in_cooldown = loop_start < post_collect_cooldown_until
+                    if (locked_ball_min_inlet_dist_m <= collect_near_inlet_distance_m
+                            and not _lock_in_cooldown):
+                        balls_collected_count += 1
+                        _near_inlet_frames = 0
+                        episode_min_ball_inlet_distance_m = float('inf')
+                        ball_detected_since = loop_start
+                        _lock_is_periodic = (
+                            periodic_shake_every_n_balls > 0
+                            and balls_collected_count % periodic_shake_every_n_balls == 0
+                        )
+                        _lock_shake_dur = periodic_shake_duration_s if _lock_is_periodic else shake_duration_s
+                        post_collect_until = loop_start + post_collect_duration_s
+                        post_collect_inlet_until = loop_start + _lock_shake_dur + post_collect_inlet_extra_s
+                        post_collect_cooldown_until = loop_start + post_collect_cooldown_s
+                        chassis.startShake(duration=_lock_shake_dur)
+                        print(
+                            f"[INFO] Ball collected #{balls_collected_count} "
+                            f"(tracked ball lost near inlet, min dist={locked_ball_min_inlet_dist_m*100:.1f}cm): "
+                            f"shaking for {_lock_shake_dur:.1f}s"
+                        )
+                    locked_ball_px = None
+                    locked_ball_lost_frames = 0
+                    locked_ball_min_inlet_dist_m = float('inf')
                 controller.update_ball_position(None)
                 with chassis.state_lock:
                     chassis.inlet_enabled = False  # No ball, turn off inlet
@@ -1623,6 +1706,7 @@ def main():
                 # Ball just appeared
                 ball_detected_since = current_time
                 episode_min_ball_inlet_distance_m = float('inf')
+                _near_inlet_frames = 0
             elif controller.ball_detected:
                 # Track closest approach to inlet during this detection episode
                 if controller.ball_pos_chassis is not None:
@@ -1635,30 +1719,93 @@ def main():
                         episode_min_ball_inlet_distance_m,
                         distance_to_inlet,
                     )
+                    locked_ball_min_inlet_dist_m = min(locked_ball_min_inlet_dist_m, distance_to_inlet)
+                    # Proximity-triggered collection: require the ball to dwell within
+                    # collect_near_inlet_distance_m for collect_near_inlet_min_frames consecutive
+                    # frames before counting as collected. This prevents false triggers from
+                    # a ball that merely passes close to the inlet without entering it.
+                    in_cooldown = current_time < post_collect_cooldown_until
+                    if distance_to_inlet <= collect_near_inlet_distance_m and not in_cooldown:
+                        _near_inlet_frames += 1
+                    else:
+                        _near_inlet_frames = 0
+                    if _near_inlet_frames >= collect_near_inlet_min_frames and not in_cooldown:
+                        detection_duration = current_time - ball_detected_since
+                        balls_collected_count += 1
+                        # Release lock so the next ball is picked up fresh
+                        locked_ball_px = None
+                        locked_ball_lost_frames = 0
+                        locked_ball_min_inlet_dist_m = float('inf')
+                        _near_inlet_frames = 0
+                        # Reset episode state so this ball isn't double-counted if it disappears later
+                        episode_min_ball_inlet_distance_m = float('inf')
+                        ball_detected_since = current_time
+                        if abs(last_motion_linear_cmd) < 1e-3 and abs(last_motion_angular_cmd) < 1e-3:
+                            last_motion_linear_cmd = min(0.03, chassis.max_linear_vel)
+                            last_motion_angular_cmd = 0.0
+                        is_periodic_shake = (
+                            periodic_shake_every_n_balls > 0
+                            and balls_collected_count % periodic_shake_every_n_balls == 0
+                        )
+                        active_shake_duration = periodic_shake_duration_s if is_periodic_shake else shake_duration_s
+                        post_collect_until = current_time + post_collect_duration_s
+                        post_collect_inlet_until = current_time + active_shake_duration + post_collect_inlet_extra_s
+                        post_collect_cooldown_until = current_time + post_collect_cooldown_s
+                        chassis.startShake(duration=active_shake_duration)
+                        if is_periodic_shake:
+                            print(
+                                f"[INFO] Ball collected #{balls_collected_count} - PERIODIC SETTLE SHAKE "
+                                f"(every {periodic_shake_every_n_balls} balls, proximity trigger, "
+                                f"dist={distance_to_inlet*100:.1f}cm): shaking for {active_shake_duration:.1f}s"
+                            )
+                        else:
+                            print(
+                                f"[INFO] Ball collected #{balls_collected_count} "
+                                f"(proximity trigger, dist={distance_to_inlet*100:.1f}cm, "
+                                f"detected for {detection_duration:.2f}s): "
+                                f"shaking for {active_shake_duration:.1f}s"
+                            )
             elif not controller.ball_detected and prev_ball_detected:
+                _near_inlet_frames = 0
                 # Ball just disappeared - check if it was detected long enough
                 detection_duration = current_time - ball_detected_since
                 in_cooldown = current_time < post_collect_cooldown_until
                 near_inlet_capture = episode_min_ball_inlet_distance_m <= collect_near_inlet_distance_m
-                ball_was_real = (detection_duration >= min_detection_duration_s) or near_inlet_capture
+                ball_was_real = (detection_duration >= min_detection_duration_s) and near_inlet_capture
                 
                 if ball_was_real and not in_cooldown:
-                    # Real ball was collected
+                    # Real ball was collected; clear target lock so the next ball starts fresh
                     balls_collected_count += 1
+                    locked_ball_px = None
+                    locked_ball_lost_frames = 0
+                    locked_ball_min_inlet_dist_m = float('inf')
                     if abs(last_motion_linear_cmd) < 1e-3 and abs(last_motion_angular_cmd) < 1e-3:
                         last_motion_linear_cmd = min(0.03, chassis.max_linear_vel)
                         last_motion_angular_cmd = 0.0
-                    post_collect_until = current_time + post_collect_duration_s
-                    post_collect_inlet_until = current_time + shake_duration_s + post_collect_inlet_extra_s
-                    post_collect_cooldown_until = current_time + post_collect_cooldown_s
-                    chassis.startShake(duration=shake_duration_s)
-                    print(
-                        f"[INFO] Ball collected #{balls_collected_count} "
-                        f"(detected for {detection_duration:.2f}s, min inlet dist={episode_min_ball_inlet_distance_m*100:.1f}cm): "
-                        f"keeping motors on for {post_collect_duration_s:.1f}s, shaking for {shake_duration_s:.1f}s, "
-                        f"inlet on for {shake_duration_s + post_collect_inlet_extra_s:.1f}s total"
+                    # Periodic settle-shake every N balls; normal per-ball shake otherwise
+                    is_periodic_shake = (
+                        periodic_shake_every_n_balls > 0
+                        and balls_collected_count % periodic_shake_every_n_balls == 0
                     )
-                elif not ball_was_real:
+                    active_shake_duration = periodic_shake_duration_s if is_periodic_shake else shake_duration_s
+                    post_collect_until = current_time + post_collect_duration_s
+                    post_collect_inlet_until = current_time + active_shake_duration + post_collect_inlet_extra_s
+                    post_collect_cooldown_until = current_time + post_collect_cooldown_s
+                    chassis.startShake(duration=active_shake_duration)
+                    if is_periodic_shake:
+                        print(
+                            f"[INFO] Ball collected #{balls_collected_count} - PERIODIC SETTLE SHAKE "
+                            f"(every {periodic_shake_every_n_balls} balls): "
+                            f"shaking for {active_shake_duration:.1f}s, then resuming inlet mode"
+                        )
+                    else:
+                        print(
+                            f"[INFO] Ball collected #{balls_collected_count} "
+                            f"(detected for {detection_duration:.2f}s, min inlet dist={episode_min_ball_inlet_distance_m*100:.1f}cm): "
+                            f"keeping motors on for {post_collect_duration_s:.1f}s, shaking for {active_shake_duration:.1f}s, "
+                            f"inlet on for {active_shake_duration + post_collect_inlet_extra_s:.1f}s total"
+                        )
+                elif not ball_was_real and not in_cooldown:
                     print(
                         f"[DEBUG] Ignoring brief/far detection "
                         f"({detection_duration:.2f}s < {min_detection_duration_s:.1f}s and "
@@ -1683,7 +1830,78 @@ def main():
             
             if running and controller.ball_detected:
                 planned_linear_vel, planned_angular_vel = controller.compute_control()
-            
+
+            # Y-bias recentering: ball is at the inlet's X depth but laterally off-centre
+            # (biased toward one friction wheel). Back up with a corrective turn so the ball
+            # moves toward the chassis X-axis on the next forward approach.
+            if (running
+                    and controller.ball_detected
+                    and controller.ball_pos_chassis is not None
+                    and current_time >= post_collect_cooldown_until):
+                _inlet_pos_rc = controller.T_chassis_to_inlet[:3, 3]
+                _ball_x_err = abs(controller.ball_pos_chassis[0] - _inlet_pos_rc[0])
+                _ball_y_bias = controller.ball_pos_chassis[1]
+                if _ball_x_err < recenter_x_proximity_m and abs(_ball_y_bias) > recenter_y_bias_m:
+                    planned_linear_vel = -recenter_linear_vel_ms
+                    planned_angular_vel = recenter_angular_gain * _ball_y_bias
+                    planned_angular_vel = max(
+                        -math.radians(45.0), min(math.radians(45.0), planned_angular_vel)
+                    )
+                    print(
+                        f"[INFO] Y-bias recentering: x_err={_ball_x_err*100:.1f}cm "
+                        f"ball_y={_ball_y_bias*100:.1f}cm -> "
+                        f"lin={planned_linear_vel:.3f}m/s "
+                        f"ang={math.degrees(planned_angular_vel):.1f}deg/s"
+                    )
+
+            # Jam-clear: count balls near inlet; if >= threshold, back up and stir
+            in_jam_clear = current_time < jam_clear_until
+            if (running
+                    and not in_jam_clear
+                    and not (current_time < post_collect_cooldown_until)
+                    and not (current_time < post_collect_until)
+                    and current_time >= jam_clear_cooldown_until
+                    and len(dets) >= jam_clear_trigger_balls):
+                _jc_inlet_pos = controller.T_chassis_to_inlet[:3, 3]
+                _balls_near = 0
+                _near_positions = []
+                for _d in dets:
+                    _du, _dv = _d[7], _d[8]
+                    _dp_cam, _ = ball_finder.project_to_3d(_du, _dv)
+                    _dp_robot = ball_finder.camera_to_robot_frame(_dp_cam)
+                    if _dp_robot is not None:
+                        _dp_chassis = controller.ball_camera_to_chassis(_dp_robot)
+                        if _dp_chassis is not None:
+                            _ddist = math.hypot(
+                                _dp_chassis[0] - _jc_inlet_pos[0],
+                                _dp_chassis[1] - _jc_inlet_pos[1],
+                            )
+                            if _ddist <= jam_clear_distance_m:
+                                _balls_near += 1
+                                _near_positions.append((_dp_chassis[0], _dp_chassis[1]))
+                if _balls_near >= jam_clear_trigger_balls:
+                    # Sparsity check: compute centroid and max distance from it
+                    _cx = sum(p[0] for p in _near_positions) / _balls_near
+                    _cy = sum(p[1] for p in _near_positions) / _balls_near
+                    _cluster_radius = max(
+                        math.hypot(p[0] - _cx, p[1] - _cy) for p in _near_positions
+                    )
+                    if _cluster_radius <= jam_clear_max_cluster_radius_m:
+                        jam_clear_start_time = current_time
+                        jam_clear_until = current_time + jam_clear_duration_s
+                        jam_clear_cooldown_until = current_time + jam_clear_duration_s + jam_clear_cooldown_s
+                        in_jam_clear = True
+                        print(
+                            f"[INFO] Jam-clear triggered: {_balls_near} balls within "
+                            f"{jam_clear_distance_m*100:.0f}cm of inlet, "
+                            f"cluster radius={_cluster_radius*100:.1f}cm (threshold={jam_clear_max_cluster_radius_m*100:.0f}cm)"
+                        )
+                    else:
+                        print(
+                            f"[DEBUG] Jam-clear skipped: {_balls_near} balls near inlet but "
+                            f"cluster radius={_cluster_radius*100:.1f}cm > {jam_clear_max_cluster_radius_m*100:.0f}cm (too spread out)"
+                        )
+
             # Determine actual commands to execute
             in_post_collect = current_time < post_collect_until
             with chassis.state_lock:
@@ -1692,6 +1910,12 @@ def main():
             if in_shake:
                 linear_vel_cmd = 0.0
                 angular_vel_cmd = 0.0
+                inlet_active = False
+                execute_motion = True
+            elif in_jam_clear:
+                # Spin 360° in place to separate clustered balls
+                linear_vel_cmd = jam_clear_backup_vel
+                angular_vel_cmd = math.radians(jam_clear_spin_vel_deg_s)
                 inlet_active = False
                 execute_motion = True
             elif in_post_collect:
@@ -1768,10 +1992,18 @@ def main():
             cv2.putText(frame_bgr, planner_display, (FRAME_W - 180, 60),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 180, 100), 2)
 
-            # Display collected ball count (session)
+            # Display collected ball count (session) and progress to next periodic shake
             count_display = f"Collected: {balls_collected_count}"
             cv2.putText(frame_bgr, count_display, (FRAME_W - 180, 90),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            if periodic_shake_every_n_balls > 0:
+                _balls_until_settle = periodic_shake_every_n_balls - (balls_collected_count % periodic_shake_every_n_balls)
+                if _balls_until_settle == periodic_shake_every_n_balls:
+                    _balls_until_settle = 0  # just shook
+                settle_display = f"Next settle: {_balls_until_settle} ball{'s' if _balls_until_settle != 1 else ''}"
+                settle_color = (0, 128, 255) if _balls_until_settle <= 1 else (180, 180, 180)
+                cv2.putText(frame_bgr, settle_display, (FRAME_W - 180, 168),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.45, settle_color, 1)
             
             # Control signal display
             ctrl_y = FRAME_H - 130
@@ -1789,8 +2021,13 @@ def main():
                 cmd_label = "Executing (manual):"
                 cmd_color = (0, 255, 255)
             elif in_shake:
-                cmd_label = f"Executing (SHAKE {shake_remaining:.1f}s):"
-                cmd_color = (0, 255, 128)
+                is_periodic_display = (
+                    periodic_shake_every_n_balls > 0
+                    and balls_collected_count % periodic_shake_every_n_balls == 0
+                )
+                shake_kind = "SETTLE" if is_periodic_display else "SHAKE"
+                cmd_label = f"Executing ({shake_kind} {shake_remaining:.1f}s):"
+                cmd_color = (0, 128, 255) if is_periodic_display else (0, 255, 128)
             elif in_post_collect:
                 cmd_label = "Executing (collect+1s):"
                 cmd_color = (0, 200, 255)
@@ -1810,6 +2047,11 @@ def main():
             inlet_color = (0, 255, 0) if inlet_active else (128, 128, 128)
             cv2.putText(frame_bgr, f"Inlet: {inlet_text}", (10, ctrl_y),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, inlet_color, 1)
+            ctrl_y += 18
+            if in_jam_clear:
+                _jc_remaining = max(0.0, jam_clear_until - current_time)
+                cv2.putText(frame_bgr, f"JAM CLEAR {_jc_remaining:.1f}s", (10, ctrl_y),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 100, 255), 2)
             
             # Compose single display window with side-by-side camera views
             display_frame = frame_bgr
@@ -1920,6 +2162,14 @@ def main():
                 if running:
                     chassis.startShake(duration=shake_duration_s)
                     print(f"[INFO] Auto-mode started: shaking for {shake_duration_s:.1f}s")
+                else:
+                    # Immediately cancel all active maneuvers and stop the robot
+                    with chassis.state_lock:
+                        chassis.shake_active = False
+                    jam_clear_until = 0.0
+                    post_collect_until = 0.0
+                    post_collect_inlet_until = 0.0
+                    chassis.run_event.clear()
             elif key_char == ord('m'):
                 manual_mode = not manual_mode
                 if manual_mode:
